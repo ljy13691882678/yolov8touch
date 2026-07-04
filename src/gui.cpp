@@ -6,6 +6,8 @@
 
 static ImVec4 g_clearColor = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
 static bool g_showSettings = true;
+static char g_modelPathBuf[256] = "";
+static char g_reloadStatus[128] = "";
 
 bool gui_init(OverlayWindow* ov) {
     IMGUI_CHECKVERSION();
@@ -74,7 +76,7 @@ void gui_render() {
     // ─── 设置面板 ────────────────────────────────────────────────
     if (g_showSettings) {
         ImGui::SetNextWindowPos(ImVec2(10, 50), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(260, 420), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(270, 500), ImGuiCond_FirstUseEver);
         ImGui::Begin("Control Panel", &g_showSettings,
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
 
@@ -93,7 +95,31 @@ void gui_render() {
 
         // 模型信息
         if (ImGui::CollapsingHeader("Model", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Text("Model: %s", g_cfg.modelPath);
+            // 模型路径输入
+            ImGui::Text("Model Path:");
+            ImGui::PushItemWidth(-1);
+            if (g_modelPathBuf[0] == '\0') {
+                strncpy(g_modelPathBuf, g_cfg.modelPath, sizeof(g_modelPathBuf) - 1);
+            }
+            ImGui::InputText("##modelPath", g_modelPathBuf, sizeof(g_modelPathBuf));
+            ImGui::PopItemWidth();
+
+            if (ImGui::Button("Load Model", ImVec2(-1, 0))) {
+                if (g_modelPathBuf[0] != '\0') {
+                    bool ok = aimbot_reload_model(g_modelPathBuf);
+                    snprintf(g_reloadStatus, sizeof(g_reloadStatus), "%s",
+                             ok ? "Model loaded OK" : "Failed to load model!");
+                }
+            }
+
+            // 状态提示
+            if (g_reloadStatus[0]) {
+                ImVec4 col = strstr(g_reloadStatus, "OK") ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f)
+                                                          : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+                ImGui::TextColored(col, "%s", g_reloadStatus);
+            }
+
+            ImGui::Text("Current: %s", g_cfg.modelPath);
             ImGui::Text("Input: %dx%d", g_cfg.inputW, g_cfg.inputH);
             ImGui::SliderInt("Range Radius", &g_cfg.rangeRadius, 100, 800);
             ImGui::SliderFloat("Conf Threshold", &g_cfg.confThresh, 0.05f, 0.95f);

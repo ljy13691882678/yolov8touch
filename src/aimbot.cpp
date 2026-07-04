@@ -18,6 +18,7 @@ long long g_lastFrameTime = 0;
 // ─── TFLite 推理状态 ─────────────────────────────────────────────
 static TfLiteModel*      g_model = nullptr;
 static TfLiteInterpreter* g_interpreter = nullptr;
+static std::mutex g_model_mutex;  // 保护模型加载/卸载
 static int g_model_input_w = 256;
 static int g_model_input_h = 256;
 static TfLiteType g_input_type = kTfLiteFloat32;
@@ -118,8 +119,88 @@ bool aimbot_init() {
 }
 
 void aimbot_shutdown() {
+    std::lock_guard<std::mutex> lock(g_model_mutex);
     if (g_interpreter) { TfLiteInterpreterDelete(g_interpreter); g_interpreter = nullptr; }
     if (g_model) { TfLiteModelDelete(g_model); g_model = nullptr; }
+}
+
+bool aimbot_reload_model(const char* newPath) {
+    if (!newPath || !newPath[0]) {
+        loge("Empty model path");
+        return false;
+    }
+    logd("Reloading model: %s", newPath);
+
+    // 先卸载旧模型
+    {
+        std::lock_guard<std::mutex> lock(g_model_mutex);
+        if (g_interpreter) { TfLiteInterpreterDelete(g_interpreter); g_interpreter = nullptr; }
+        if (g_model) { TfLiteModelDelete(g_model); g_model = nullptr; }
+    }
+
+    // 加载新模型
+    TfLiteModel* newModel = TfLiteModelCreateFromFile(newPath);
+    if (!newModel) {
+        loge("Failed to load model: %s", newPath);
+        return false;
+    }
+
+    TfLiteInterpreterOptions* opts = TfLiteInterpreterOptionsCreate();
+    TfLiteInterpreterOptionsSetNumThreads(opts, 4);
+    TfLiteInterpreter* newInterp = TfLiteInterpreterCreate(newModel, opts);
+    TfLiteInterpreterOptionsDelete(opts);
+
+    if (!newInterp) {
+        loge("Failed to create interpreter");
+        TfLiteModelDelete(newModel);
+        return false;
+    }
+
+    if (TfLiteInterpreterAllocateTensors(newInterp) != kTfLiteOk) {
+        loge("Failed to allocate tensors");
+        TfLiteInterpreterDelete(newInterp);
+        TfLiteModelDelete(newModel);
+        return false;
+    }
+
+    // 读取模型信息
+    const TfLiteTensor* input = TfLiteInterpreterGetInputTensor(newInterp, 0);
+    if (input) {
+        g_model_input_h = TfLiteTensorDim(input, 1);
+        g_model_input_w = TfLiteTensorDim(input, 2);
+        g_input_type = TfLiteTensorType(input);
+        TfLiteQuantizationParams q = TfLiteTensorQuantizationParams(input);
+        g_input_scale = q.scale;
+        g_input_zero_point = q.zero_point;
+        g_cfg.inputW = g_model_input_w;
+        g_cfg.inputH = g_model_input_h;
+    }
+
+    int outCount = TfLiteInterpreterGetOutputTensorCount(newInterp);
+    if (outCount > 0) {
+        const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(newInterp, 0);
+        if (out) {
+            int ndim = TfLiteTensorNumDims(out);
+            int channels = ndim >= 2 ? TfLiteTensorDim(out, ndim - 1) : 0;
+            g_num_classes = channels - 4;
+            if (g_num_classes < 1) g_num_classes = 1;
+        }
+    }
+
+    // 原子替换
+    {
+        std::lock_guard<std::mutex> lock(g_model_mutex);
+        g_model = newModel;
+        g_interpreter = newInterp;
+    }
+
+    // 更新配置路径
+    strncpy(g_cfg.modelPath, newPath, sizeof(g_cfg.modelPath) - 1);
+    g_cfg.modelPath[sizeof(g_cfg.modelPath) - 1] = '\0';
+
+    logd("Model reloaded: %s (%dx%d, type=%d, classes=%d)",
+         newPath, g_model_input_w, g_model_input_h, (int)g_input_type, g_num_classes);
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -422,7 +503,9 @@ static void pid_aim(const std::vector<Detection>& dets, long long frameTime) {
 //  单帧迭代
 // ═══════════════════════════════════════════════════════════════════
 void aimbot_loop_iteration() {
-    if (!g_interpreter || !g_running) return;
+    if (!g_running) return;
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+    if (!g_interpreter) return;
     long long t0 = getTimeUs();
 
     // 1. 截屏
