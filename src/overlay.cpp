@@ -42,22 +42,29 @@ static String8_ctor_t        p_String8_ctor = nullptr;
 //  ELF 符号表扫描 — 通过 demangled name 子串匹配
 // ═══════════════════════════════════════════════════════════════════
 
-// 遍历 .dynsym 表，用 demangled name 子串匹配找符号
-// lib: dlopen 返回的句柄
-// demangled_substr: 要匹配的 demangled 名子串 (如 "createSurface")
-// 返回: 找到的符号地址，未找到返回 nullptr
-static void* find_symbol_by_demangled(void* lib, const char* demangled_substr) {
-    struct link_map* map = nullptr;
-    if (dlinfo(lib, RTLD_DI_LINKMAP, &map) != 0 || !map) {
-        fprintf(stderr, "  ELF: dlinfo(RTLD_DI_LINKMAP) failed\n");
-        return nullptr;
-    }
+// 用 dl_iterate_phdr 找到 libgui.so 的 ELF 基址，然后遍历 .dynsym
+// 通过 __cxa_demangle 解码 mangled name，子串匹配找到目标符号
 
-    uintptr_t base = map->l_addr;
+struct FindCtx {
+    const char* libname;     // 目标库名，如 "libgui.so"
+    const char* substr;      // demangled 子串，如 "createSurface"
+    void*       result;      // 输出: 符号地址
+    uintptr_t   base;        // 输出: ELF 基址
+};
+
+static int phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
+    (void)size;
+    FindCtx* ctx = (FindCtx*)data;
+    if (ctx->result) return 1;  // 已找到
+
+    const char* name = info->dlpi_name;
+    if (!name || !strstr(name, ctx->libname)) return 0;
+
+    uintptr_t base = info->dlpi_addr;
     Elf64_Ehdr* ehdr = (Elf64_Ehdr*)base;
-    if (ehdr->e_phnum == 0 || ehdr->e_phoff == 0) return nullptr;
+    if (ehdr->e_phnum == 0) return 0;
 
-    // 找 PT_DYNAMIC 段
+    // 找 PT_DYNAMIC
     Elf64_Phdr* phdr = (Elf64_Phdr*)(base + ehdr->e_phoff);
     Elf64_Dyn* dynamic = nullptr;
     for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -66,57 +73,54 @@ static void* find_symbol_by_demangled(void* lib, const char* demangled_substr) {
             break;
         }
     }
-    if (!dynamic) return nullptr;
+    if (!dynamic) return 0;
 
-    // 遍历 .dynamic 找 SYMTAB / STRTAB
+    // 遍历 .dynamic
     Elf64_Sym* symtab = nullptr;
     const char* strtab = nullptr;
-    size_t symcount = 0;
+    size_t strtab_size = 0;
     for (Elf64_Dyn* d = dynamic; d->d_tag != DT_NULL; d++) {
         if (d->d_tag == DT_SYMTAB) symtab = (Elf64_Sym*)(base + d->d_un.d_ptr);
         if (d->d_tag == DT_STRTAB) strtab = (const char*)(base + d->d_un.d_ptr);
-        if (d->d_tag == DT_GNU_HASH) {
-            // 粗略估算符号数量 (不求精确，遍历时遇到边界就停)
-            symcount = 50000;
-        }
+        if (d->d_tag == DT_STRSZ)  strtab_size = d->d_un.d_val;
     }
-    if (!symtab || !strtab) return nullptr;
+    if (!symtab || !strtab || !strtab_size) return 0;
 
-    // 没有精确的 symcount 就用一个安全的非精确上限
-    // 遍历到第一个 st_name 越界或遇到空值反复出现为止
-    size_t strtab_size = 0;
-    // 粗略获取 strtab 大小 (通过 DT_STRSZ)
-    for (Elf64_Dyn* d = dynamic; d->d_tag != DT_NULL; d++) {
-        if (d->d_tag == DT_STRSZ) { strtab_size = d->d_un.d_val; break; }
-    }
-
-    // 遍历符号表
+    // 遍历符号
     for (size_t i = 0; i < 65536; i++) {
-        if (symtab[i].st_name >= strtab_size) break;  // 越界
-        const char* name = strtab + symtab[i].st_name;
-        if (name[0] == '\0') continue;
+        if (symtab[i].st_name >= strtab_size) break;
+        const char* sname = strtab + symtab[i].st_name;
+        if (sname[0] == '\0') continue;
         if (ELF64_ST_TYPE(symtab[i].st_info) != STT_FUNC) continue;
         if (symtab[i].st_value == 0) continue;
 
         int status;
-        char* demangled = abi::__cxa_demangle(name, nullptr, nullptr, &status);
+        char* demangled = abi::__cxa_demangle(sname, nullptr, nullptr, &status);
         if (status == 0 && demangled) {
-            if (strstr(demangled, demangled_substr)) {
-                void* addr = (void*)(base + symtab[i].st_value);
-                fprintf(stderr, "  ELF: found '%s' -> %s @ %p\n", demangled_substr, demangled, addr);
+            if (strstr(demangled, ctx->substr)) {
+                ctx->result = (void*)(base + symtab[i].st_value);
+                ctx->base = base;
+                fprintf(stderr, "  ELF: found '%s' -> %s @ %p\n", ctx->substr, demangled, ctx->result);
                 free(demangled);
-                return addr;
+                return 1;  // 停止遍历
             }
             free(demangled);
         }
     }
-    return nullptr;
+    return 0;
+}
+
+static void* find_symbol_by_demangled(const char* libname, const char* demangled_substr) {
+    FindCtx ctx = { libname, demangled_substr, nullptr, 0 };
+    dl_iterate_phdr(phdr_callback, &ctx);
+    return ctx.result;
 }
 
 // ═══════════════════════════════════════════════════════════════════
 //  加载所有符号
 // ═══════════════════════════════════════════════════════════════════
 static bool load_symbols() {
+    // 先 dlopen 确保库已加载到进程
     g_libgui = dlopen("libgui.so", RTLD_NOW);
     if (!g_libgui) { fprintf(stderr, "DLOPEN: libgui.so not found\n"); return false; }
 
@@ -124,30 +128,29 @@ static bool load_symbols() {
     if (!g_libutils) { fprintf(stderr, "DLOPEN: libutils.so not found\n"); return false; }
 
     // String8 构造函数
-    p_String8_ctor = (String8_ctor_t)find_symbol_by_demangled(g_libutils, "String8::String8");
+    p_String8_ctor = (String8_ctor_t)find_symbol_by_demangled("libutils.so", "String8::String8");
     if (!p_String8_ctor) { fprintf(stderr, "DLOPEN: String8 ctor not found\n"); return false; }
 
     // SurfaceComposerClient 构造函数
-    p_SCC_ctor = (SCC_ctor_t)find_symbol_by_demangled(g_libgui, "SurfaceComposerClient::SurfaceComposerClient");
+    p_SCC_ctor = (SCC_ctor_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::SurfaceComposerClient");
     if (!p_SCC_ctor) { fprintf(stderr, "DLOPEN: SCC ctor not found\n"); return false; }
 
-    // createSurface (可能有多个重载，取第一个匹配)
-    p_SCC_createSurface = (SCC_createSurface_t)find_symbol_by_demangled(g_libgui, "SurfaceComposerClient::createSurface");
+    // createSurface
+    p_SCC_createSurface = (SCC_createSurface_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::createSurface");
     if (!p_SCC_createSurface) {
-        // 某些 Android 版本改名了
-        p_SCC_createSurface = (SCC_createSurface_t)find_symbol_by_demangled(g_libgui, "SurfaceComposerClient::createWithSurfaceParent");
+        p_SCC_createSurface = (SCC_createSurface_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::createWithSurfaceParent");
     }
     if (!p_SCC_createSurface) { fprintf(stderr, "DLOPEN: createSurface not found\n"); return false; }
 
     // SurfaceControl::getSurface
-    p_SC_getSurface = (SC_getSurface_t)find_symbol_by_demangled(g_libgui, "SurfaceControl::getSurface");
+    p_SC_getSurface = (SC_getSurface_t)find_symbol_by_demangled("libgui.so", "SurfaceControl::getSurface");
     if (!p_SC_getSurface) { fprintf(stderr, "DLOPEN: getSurface not found\n"); return false; }
 
-    // Transaction (optional, no error)
-    p_Transaction_ctor = (Transaction_ctor_t)find_symbol_by_demangled(g_libgui, "SurfaceComposerClient::Transaction::Transaction");
-    p_Transaction_setLayer = (Transaction_setLayer_t)find_symbol_by_demangled(g_libgui, "Transaction::setLayer");
-    p_Transaction_show = (Transaction_show_t)find_symbol_by_demangled(g_libgui, "Transaction::show");
-    p_Transaction_apply = (Transaction_apply_t)find_symbol_by_demangled(g_libgui, "Transaction::apply");
+    // Transaction
+    p_Transaction_ctor = (Transaction_ctor_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::Transaction::Transaction");
+    p_Transaction_setLayer = (Transaction_setLayer_t)find_symbol_by_demangled("libgui.so", "Transaction::setLayer");
+    p_Transaction_show = (Transaction_show_t)find_symbol_by_demangled("libgui.so", "Transaction::show");
+    p_Transaction_apply = (Transaction_apply_t)find_symbol_by_demangled("libgui.so", "Transaction::apply");
 
     fprintf(stderr, "DLOPEN: all symbols loaded\n");
     return true;
