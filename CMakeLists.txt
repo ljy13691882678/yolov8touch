@@ -57,9 +57,9 @@ target_include_directories(yolov8touch BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/stubs
 )
 
-# OpenMP support for NCNN (NDK toolchain provides -fopenmp built-in)
+# OpenMP support for NCNN — static link to avoid runtime libomp.so dependency
 target_compile_options(yolov8touch PRIVATE -fopenmp)
-target_link_options(yolov8touch PRIVATE -fopenmp)
+target_link_options(yolov8touch PRIVATE -static-openmp)
 
 # Private Android system libs (gui/ui/binder/utils) are not in NDK.
 # CI provides stub .so files; real libs are on the device at runtime.
