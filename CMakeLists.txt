@@ -57,13 +57,19 @@ target_include_directories(yolov8touch BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/stubs
 )
 
-# OpenMP static linking for NCNN — avoids runtime libomp.so dependency on device.
-# libomp.a is found by CI and passed via OMP_STATIC_LIB_PATH.
+# OpenMP — compile with -fopenmp, but link libomp.a statically.
+# Using -fopenmp at link-time adds -lomp (dynamic), which causes "libomp.so not found".
+# We pass the .a file directly via -Wl,-Bstatic to force static linking.
 target_compile_options(yolov8touch PRIVATE -fopenmp)
-target_link_options(yolov8touch PRIVATE -fopenmp)
 
 if(OMP_STATIC_LIB_PATH)
-    target_link_options(yolov8touch PRIVATE ${OMP_STATIC_LIB_PATH})
+    # Get the directory containing libomp.a
+    get_filename_component(OMP_LIB_DIR ${OMP_STATIC_LIB_PATH} DIRECTORY)
+    target_link_options(yolov8touch PRIVATE
+        -Wl,-Bstatic
+        ${OMP_STATIC_LIB_PATH}
+        -Wl,-Bdynamic
+    )
     message(STATUS "Static OpenMP: ${OMP_STATIC_LIB_PATH}")
 else()
     message(WARNING "OMP_STATIC_LIB_PATH not set — libomp.so required on device")
