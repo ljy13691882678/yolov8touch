@@ -2,17 +2,17 @@
  * yolov8touch — Root shell AI 自瞄 + ImGui 可视化 UI
  *
  * 运行方式:
- *   su -c /data/local/tmp/yolov8touch --model /sdcard/yolov8.param --width 1080 --height 2400
+ *   su -c /data/local/tmp/yolov8touch --model /data/local/tmp/yolov8n_float_256.tflite
  *
  * 原理:
  *   1. screencap 截屏 → PNG 解码 → RGBA
- *   2. NCNN YOLOv8 推理 → 检测目标框
+ *   2. TFLite YOLOv8 推理 → 检测目标框
  *   3. 选最近目标 → PID 控制 → uinput 触摸注入
  *   4. ImGui 渲染透明悬浮窗 → 显示检测框 + 设置面板
  *   5. 60fps 主循环，Ctrl+C 退出
  *
  * 依赖:
- *   - libncnn.a (NCNN)
+ *   - libtensorflowlite_jni.so (TFLite, 设备自带)
  *   - libgui, libui, libbinder (SurfaceComposer 悬浮窗)
  *   - libEGL, libGLESv3 (OpenGL ES 3.0)
  *   - libandroid, liblog (Android 系统库)

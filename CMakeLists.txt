@@ -4,29 +4,9 @@ project("yolov8touch")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ─── NCNN ────────────────────────────────────────────────────────
-set(NCNN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ncnn/arm64-v8a)
-set(NCNN_INCLUDE_DIR ${NCNN_DIR}/include)
-set(NCNN_LIB_DIR ${NCNN_DIR}/lib)
-
-if(NOT EXISTS ${NCNN_LIB_DIR}/libncnn.a)
-    message(FATAL_ERROR "NCNN lib not found! Copy ncnn/ from YoloTouchHelp/app/src/main/cpp/ncnn/")
-endif()
-
-add_library(ncnn STATIC IMPORTED)
-set_target_properties(ncnn PROPERTIES IMPORTED_LOCATION ${NCNN_LIB_DIR}/libncnn.a)
-
-macro(add_vulkan_lib name)
-    add_library(${name} STATIC IMPORTED)
-    set_target_properties(${name} PROPERTIES IMPORTED_LOCATION ${NCNN_LIB_DIR}/lib${name}.a)
-endmacro()
-add_vulkan_lib(glslang)
-add_vulkan_lib(SPIRV)
-add_vulkan_lib(glslang-default-resource-limits)
-add_vulkan_lib(MachineIndependent)
-add_vulkan_lib(OSDependent)
-add_vulkan_lib(OGLCompiler)
-add_vulkan_lib(GenericCodeGen)
+# ─── TFLite ───────────────────────────────────────────────────────
+# TFLite C API headers are bundled in src/tflite/include/
+set(TFLITE_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/tflite/include)
 
 # ─── ImGui ────────────────────────────────────────────────────────
 set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/imgui)
@@ -45,7 +25,7 @@ add_executable(yolov8touch
 )
 
 target_include_directories(yolov8touch PRIVATE
-    ${NCNN_INCLUDE_DIR}
+    ${TFLITE_INCLUDE_DIR}
     ${IMGUI_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
@@ -57,26 +37,15 @@ target_include_directories(yolov8touch BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/stubs
 )
 
-# OpenMP — compile with -fopenmp, but link libomp.a statically.
-# Using -fopenmp at link-time adds -lomp (dynamic), which causes "libomp.so not found".
-# We pass the .a file directly via -Wl,-Bstatic to force static linking.
-target_compile_options(yolov8touch PRIVATE -fopenmp)
-
-if(OMP_STATIC_LIB_PATH)
-    # Get the directory containing libomp.a
-    get_filename_component(OMP_LIB_DIR ${OMP_STATIC_LIB_PATH} DIRECTORY)
-    target_link_options(yolov8touch PRIVATE
-        -Wl,-Bstatic
-        ${OMP_STATIC_LIB_PATH}
-        -Wl,-Bdynamic
-    )
-    message(STATUS "Static OpenMP: ${OMP_STATIC_LIB_PATH}")
-else()
-    message(WARNING "OMP_STATIC_LIB_PATH not set — libomp.so required on device")
+# ─── TFLite shared library ────────────────────────────────────────
+# CI provides stub .so; real libtensorflowlite_jni.so is on device
+if(DEFINED STUB_LIBS_DIR)
+    add_library(tensorflowlite_jni SHARED IMPORTED)
+    set_target_properties(tensorflowlite_jni PROPERTIES
+        IMPORTED_LOCATION ${STUB_LIBS_DIR}/libtensorflowlite_jni.so)
 endif()
 
 # Private Android system libs (gui/ui/binder/utils) are not in NDK.
-# CI provides stub .so files; real libs are on the device at runtime.
 if(DEFINED STUB_LIBS_DIR)
     macro(add_stub_lib name)
         add_library(${name} SHARED IMPORTED)
@@ -89,8 +58,7 @@ if(DEFINED STUB_LIBS_DIR)
 endif()
 
 target_link_libraries(yolov8touch
-    ncnn glslang SPIRV glslang-default-resource-limits
-    MachineIndependent OSDependent OGLCompiler GenericCodeGen
+    tensorflowlite_jni
     EGL GLESv3
     gui ui binder utils
     android log

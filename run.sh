@@ -12,7 +12,7 @@ TARGET="aarch64-linux-android"
 API_LEVEL=31
 BINARY_NAME="yolov8touch"
 DEVICE_PATH="/data/local/tmp/$BINARY_NAME"
-MODEL_PATH="/data/local/tmp/yolov8.param"
+MODEL_PATH="/data/local/tmp/yolov8n_float_256.tflite"
 SCREEN_W=1080
 SCREEN_H=2400
 
@@ -34,18 +34,6 @@ done
 # ─── 构建 ────────────────────────────────────────────────────────
 if $DO_BUILD; then
     echo "=== Building $BINARY_NAME ==="
-    # 检查 NCNN (从 YoloTouchHelp 复制)
-    if [ ! -f "ncnn/arm64-v8a/lib/libncnn.a" ]; then
-        echo "Copying NCNN from YoloTouchHelp..."
-        NCNN_SRC="../YoloTouchHelp/app/src/main/cpp/ncnn"
-        if [ -d "$NCNN_SRC" ]; then
-            cp -r "$NCNN_SRC" ncnn/
-        else
-            echo "ERROR: ncnn/ not found. Please copy from YoloTouchHelp first."
-            exit 1
-        fi
-    fi
-
     mkdir -p build && cd build
     cmake .. \
         -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \

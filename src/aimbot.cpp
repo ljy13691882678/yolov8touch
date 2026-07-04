@@ -1,310 +1,636 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "aimbot.h"
 #include <linux/uinput.h>
-#include <dirent.h>
-#include <sys/ioctl.h>
-#include <errno.h>
+#include <array>
+#include <chrono>
+#include <cstdarg>
 
-volatile int g_running = 1;
+// ─── 全局变量 ────────────────────────────────────────────────────
+volatile int g_running = 0;
 AimbotConfig g_cfg;
 std::mutex g_detections_mutex;
 std::vector<Detection> g_detections;
-float g_aimFPS = 0, g_detectFPS = 0;
+float g_aimFPS = 0;
+float g_detectFPS = 0;
 int g_frameCount = 0;
 long long g_lastFrameTime = 0;
 
-static ncnn::Net* g_net = nullptr;
-static PIDState g_pid;
+// ─── TFLite 推理状态 ─────────────────────────────────────────────
+static TfLiteModel*      g_model = nullptr;
+static TfLiteInterpreter* g_interpreter = nullptr;
+static int g_model_input_w = 256;
+static int g_model_input_h = 256;
+static TfLiteType g_input_type = kTfLiteFloat32;
+static float g_input_scale = 1.0f;
+static int g_input_zero_point = 0;
+static int g_num_classes = 1;
+
+// ─── uinput ──────────────────────────────────────────────────────
 static int g_uinput_fd = -1;
-static int g_screenW = 0, g_screenH = 0;
 
-// ─── 工具函数 ───────────────────────────────────────────────────
-static inline long long now_us() {
-    struct timeval tv; gettimeofday(&tv, nullptr);
-    return tv.tv_sec * 1000000LL + tv.tv_usec;
+// ─── PID 状态 ────────────────────────────────────────────────────
+static PIDState g_pid;
+
+// ─── 日志 ─────────────────────────────────────────────────────────
+#define LOG_TAG "yolov8touch"
+static void logd(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[%s] ", LOG_TAG);
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
 }
-static inline float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
-
-// ─── 屏幕捕获 ───────────────────────────────────────────────────
-static uint8_t* capture_screen_png(size_t* out_len) {
-    int pipefd[2];
-    if (pipe(pipefd) < 0) return nullptr;
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(pipefd[0]); dup2(pipefd[1], STDOUT_FILENO); close(pipefd[1]);
-        execlp("screencap", "screencap", "-p", (char*)nullptr);
-        _exit(1);
-    }
-    close(pipefd[1]);
-    size_t cap = 4 * 1024 * 1024;
-    uint8_t* buf = (uint8_t*)malloc(cap);
-    size_t total = 0;
-    ssize_t n;
-    while ((n = read(pipefd[0], buf + total, cap - total)) > 0) {
-        total += n;
-        if (total >= cap) { cap *= 2; buf = (uint8_t*)realloc(buf, cap); }
-    }
-    close(pipefd[0]); waitpid(pid, nullptr, 0);
-    if (total == 0) { free(buf); return nullptr; }
-    *out_len = total; return buf;
+static void loge(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[%s] ERROR: ", LOG_TAG);
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
 }
 
-// ─── NCNN 推理 ──────────────────────────────────────────────────
-static bool init_ncnn(const char* path) {
-    g_net = new ncnn::Net();
-    g_net->opt.use_vulkan_compute = false;
-    g_net->opt.num_threads = 4;
-    char bin[256]; strncpy(bin, path, 250); bin[250] = 0;
-    char* dot = strrchr(bin, '.'); if (dot) strcpy(dot, ".bin");
-    if (g_net->load_param(path) != 0 || g_net->load_model(bin) != 0) {
-        fprintf(stderr, "ERR: model load failed\n"); return false;
-    }
-    return true;
-}
-
-static int detect_objects(uint8_t* rgba, int w, int h, int ox, int oy, int rw, int rh,
-                          Detection* dets, int maxDets) {
-    if (!g_net) return 0;
-    int iw = g_cfg.inputW, ih = g_cfg.inputH;
-    ncnn::Mat in = ncnn::Mat::from_pixels(rgba + (oy * w + ox) * 4, ncnn::Mat::PIXEL_RGBA, rw, rh);
-    ncnn::Mat rs; ncnn::resize_bilinear(in, rs, iw, ih);
-    const float m[3] = {0,0,0}, n[3] = {1/255.0f, 1/255.0f, 1/255.0f};
-    rs.substract_mean_normalize(m, n);
-    ncnn::Extractor ex = g_net->create_extractor();
-    ex.input("in0", rs);
-    ncnn::Mat out; ex.extract("out0", out);
-    int na = out.h, fl = out.w, nc = fl - 16;
-    if (nc <= 0) nc = 1;
-    float iiw = 1.0f/iw, iih = 1.0f/ih;
-    int count = 0;
-    for (int a = 0; a < na && count < maxDets; a++) {
-        const float* row = out.row(a);
-        int bc = 0; float bs = 0;
-        for (int c = 0; c < nc; c++) { float s = sigmoid(row[16+c]); if (s > bs) { bs = s; bc = c; } }
-        if (bs < g_cfg.confThresh) continue;
-        float box[4] = {0,0,0,0};
-        for (int b = 0; b < 4; b++) {
-            float se = 0, w = 0; const float dw[4] = {0,1,2,3};
-            for (int r = 0; r < 4; r++) { float e = expf(row[b*4+r]); se += e; w += e * dw[r]; }
-            box[b] = w / se;
-        }
-        int stride = na > 8400 ? 8 : na > 2100 ? 16 : 32;
-        int grid = (int)sqrtf((float)na);
-        int gy = a / grid, gx = a % grid;
-        float cx = (gx + 0.5f) * stride * iiw, cy = (gy + 0.5f) * stride * iih;
-        float x1 = (cx - box[0]*iiw - box[2]*iiw*0.5f) * rw + ox;
-        float y1 = (cy - box[1]*iih - box[3]*iih*0.5f) * rh + oy;
-        float x2 = x1 + box[2]*iiw * rw, y2 = y1 + box[3]*iih * rh;
-        if (x1 < 0) x1 = 0; if (y1 < 0) y1 = 0;
-        if (x2 > w) x2 = w; if (y2 > h) y2 = h;
-        dets[count++] = {x1, y1, x2, y2, bs, (int)bc};
-    }
-    // NMS
-    if (count > 1) {
-        for (int i = 0; i < count-1; i++) for (int j = i+1; j < count; j++)
-            if (dets[j].score > dets[i].score) { Detection t = dets[i]; dets[i] = dets[j]; dets[j] = t; }
-        bool* sup = (bool*)calloc(count, 1); int k = 0;
-        for (int i = 0; i < count; i++) {
-            if (sup[i]) continue; dets[k++] = dets[i];
-            for (int j = i+1; j < count; j++) {
-                if (sup[j] || dets[i].classId != dets[j].classId) continue;
-                float ix1 = fmaxf(dets[i].x1, dets[j].x1), iy1 = fmaxf(dets[i].y1, dets[j].y1);
-                float ix2 = fminf(dets[i].x2, dets[j].x2), iy2 = fminf(dets[i].y2, dets[j].y2);
-                float iw = ix2-ix1, ih = iy2-iy1;
-                if (iw <= 0 || ih <= 0) continue;
-                float ia = iw*ih, aa = (dets[i].x2-dets[i].x1)*(dets[i].y2-dets[i].y1);
-                float ba = (dets[j].x2-dets[j].x1)*(dets[j].y2-dets[j].y1);
-                if (ia / (aa+ba-ia) > g_cfg.nmsThresh) sup[j] = true;
-            }
-        }
-        count = k; free(sup);
-    }
-    return count;
-}
-
-// ─── 目标选择 ───────────────────────────────────────────────────
-static Detection* select_target(Detection* dets, int n, int cx, int cy) {
-    float best = 1e9f; Detection* b = nullptr;
-    for (int i = 0; i < n; i++) {
-        float tx = (dets[i].x1+dets[i].x2)*0.5f, ty = (dets[i].y1+dets[i].y2)*0.5f;
-        float d = (tx-cx)*(tx-cx) + (ty-cy)*(ty-cy);
-        if (d < best) { best = d; b = &dets[i]; }
-    }
-    return b;
-}
-
-// ─── PID 控制 ───────────────────────────────────────────────────
-static void pid_aim(float tx, float ty) {
-    float cx = g_pid.centerX, cy = g_pid.centerY;
-    float ex = tx - cx, ey = ty - cy;
-    const float ct = 5.0f;
-    if (fabsf(ex) < ct && fabsf(ey) < ct) {
-        if (g_pid.pointerDown && ++g_pid.deadzoneFrames >= 3) {
-            touch_up(TOUCH_VIRTUAL_SLOT); g_pid.pointerDown = false; g_pid.deadzoneFrames = 0;
-        }
-        return;
-    }
-    g_pid.deadzoneFrames = 0;
-    if (!g_pid.pointerDown) {
-        touch_down(TOUCH_VIRTUAL_SLOT, TOUCH_VIRTUAL_ID, (int)cx, (int)cy);
-        g_pid.pointerDown = true;
-    }
-    if (ex * g_pid.prevErrorX <= 0) g_pid.integralX = 0;
-    if (ey * g_pid.prevErrorY <= 0) g_pid.integralY = 0;
-    float dt = 0.008f;
-    g_pid.integralX += ex * dt; g_pid.integralY += ey * dt;
-    float il = 100; if (g_pid.integralX > il) g_pid.integralX = il; if (g_pid.integralX < -il) g_pid.integralX = -il;
-    if (g_pid.integralY > il) g_pid.integralY = il; if (g_pid.integralY < -il) g_pid.integralY = -il;
-    float dx = (ex - g_pid.prevErrorX) / dt, dy = (ey - g_pid.prevErrorY) / dt;
-    float mx = ex * g_cfg.kp + g_pid.integralX * g_cfg.ki + dx * g_cfg.kd;
-    float my = ey * g_cfg.kp + g_pid.integralY * g_cfg.ki + dy * g_cfg.kd;
-    mx = g_pid.lastMoveX * g_cfg.smooth + mx * (1 - g_cfg.smooth);
-    my = g_pid.lastMoveY * g_cfg.smooth + my * (1 - g_cfg.smooth);
-    g_pid.lastMoveX = mx; g_pid.lastMoveY = my;
-    g_pid.prevErrorX = ex; g_pid.prevErrorY = ey;
-    float d = sqrtf(mx*mx + my*my);
-    if (d > g_cfg.maxMovePerFrame) { mx = mx/d * g_cfg.maxMovePerFrame; my = my/d * g_cfg.maxMovePerFrame; }
-    g_pid.centerX += mx; g_pid.centerY += my;
-    if (g_pid.centerX < 0) g_pid.centerX = 0; if (g_pid.centerY < 0) g_pid.centerY = 0;
-    if (g_pid.centerX > g_screenW) g_pid.centerX = g_screenW;
-    if (g_pid.centerY > g_screenH) g_pid.centerY = g_screenH;
-    touch_move(TOUCH_VIRTUAL_SLOT, (int)g_pid.centerX, (int)g_pid.centerY);
-}
-
-static void pid_reset(int cx, int cy) {
-    memset(&g_pid, 0, sizeof(g_pid));
-    g_pid.centerX = cx; g_pid.centerY = cy;
-}
-
-// ─── uinput 触摸注入 ────────────────────────────────────────────
-bool touch_init_aimbot(int sw, int sh) {
-    g_screenW = sw; g_screenH = sh;
-    g_uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-    if (g_uinput_fd < 0) { g_uinput_fd = open("/dev/input/uinput", O_WRONLY | O_NONBLOCK); }
-    if (g_uinput_fd < 0) { fprintf(stderr, "ERR: open uinput failed\n"); return false; }
-    ioctl(g_uinput_fd, UI_SET_EVBIT, EV_KEY);
-    ioctl(g_uinput_fd, UI_SET_EVBIT, EV_SYN);
-    ioctl(g_uinput_fd, UI_SET_EVBIT, EV_ABS);
-    ioctl(g_uinput_fd, UI_SET_KEYBIT, BTN_TOUCH);
-    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_SLOT);
-    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID);
-    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_X);
-    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y);
-    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MAJOR);
-    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_PRESSURE);
-    struct uinput_user_dev udev = {};
-    snprintf(udev.name, UINPUT_MAX_NAME_SIZE, "yolov8touch");
-    udev.id.bustype = BUS_VIRTUAL; udev.id.vendor = 0x1; udev.id.product = 0x1;
-    udev.absmax[ABS_MT_SLOT] = 15;
-    udev.absmax[ABS_MT_POSITION_X] = sw; udev.absmax[ABS_MT_POSITION_Y] = sh;
-    udev.absmax[ABS_MT_TOUCH_MAJOR] = 255; udev.absmax[ABS_MT_PRESSURE] = 255;
-    write(g_uinput_fd, &udev, sizeof(udev));
-    if (ioctl(g_uinput_fd, UI_DEV_CREATE) < 0) { fprintf(stderr, "ERR: UI_DEV_CREATE\n"); return false; }
-    return true;
-}
-
-void touch_close_aimbot() {
-    if (g_uinput_fd >= 0) { ioctl(g_uinput_fd, UI_DEV_DESTROY); close(g_uinput_fd); g_uinput_fd = -1; }
-}
-
-void touch_down(int slot, int id, int x, int y) {
-    if (g_uinput_fd < 0) return;
-    struct input_event ev[6];
-    memset(ev, 0, sizeof(ev));
-    int i = 0;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_SLOT; ev[i].value = slot; i++;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_TRACKING_ID; ev[i].value = id; i++;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_POSITION_X; ev[i].value = x; i++;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_POSITION_Y; ev[i].value = y; i++;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_TOUCH_MAJOR; ev[i].value = 10; i++;
-    ev[i].type = EV_SYN; ev[i].code = SYN_REPORT; ev[i].value = 0; i++;
-    write(g_uinput_fd, ev, sizeof(ev));
-}
-
-void touch_move(int slot, int x, int y) {
-    if (g_uinput_fd < 0) return;
-    struct input_event ev[4];
-    memset(ev, 0, sizeof(ev));
-    int i = 0;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_SLOT; ev[i].value = slot; i++;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_POSITION_X; ev[i].value = x; i++;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_POSITION_Y; ev[i].value = y; i++;
-    ev[i].type = EV_SYN; ev[i].code = SYN_REPORT; ev[i].value = 0; i++;
-    write(g_uinput_fd, ev, sizeof(ev));
-}
-
-void touch_up(int slot) {
-    if (g_uinput_fd < 0) return;
-    struct input_event ev[3];
-    memset(ev, 0, sizeof(ev));
-    int i = 0;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_SLOT; ev[i].value = slot; i++;
-    ev[i].type = EV_ABS; ev[i].code = ABS_MT_TRACKING_ID; ev[i].value = -1; i++;
-    ev[i].type = EV_SYN; ev[i].code = SYN_REPORT; ev[i].value = 0; i++;
-    write(g_uinput_fd, ev, sizeof(ev));
-}
-
-// ─── 生命周期 ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+//  TFLite 模型加载
+// ═══════════════════════════════════════════════════════════════════
 bool aimbot_init() {
-    if (!init_ncnn(g_cfg.modelPath)) return false;
-    if (!touch_init_aimbot(g_cfg.screenW, g_cfg.screenH)) return false;
-    pid_reset(g_cfg.screenW / 2, g_cfg.screenH / 2);
-    fprintf(stderr, "Aimbot: model loaded, uinput ready\n");
+    logd("Loading TFLite model: %s", g_cfg.modelPath);
+
+    g_model = TfLiteModelCreateFromFile(g_cfg.modelPath);
+    if (!g_model) {
+        loge("Failed to load model: %s", g_cfg.modelPath);
+        return false;
+    }
+
+    TfLiteInterpreterOptions* opts = TfLiteInterpreterOptionsCreate();
+    TfLiteInterpreterOptionsSetNumThreads(opts, 4);
+    g_interpreter = TfLiteInterpreterCreate(g_model, opts);
+    TfLiteInterpreterOptionsDelete(opts);
+
+    if (!g_interpreter) {
+        loge("Failed to create interpreter");
+        TfLiteModelDelete(g_model);
+        g_model = nullptr;
+        return false;
+    }
+
+    if (TfLiteInterpreterAllocateTensors(g_interpreter) != kTfLiteOk) {
+        loge("Failed to allocate tensors");
+        TfLiteInterpreterDelete(g_interpreter);
+        TfLiteModelDelete(g_model);
+        g_interpreter = nullptr;
+        g_model = nullptr;
+        return false;
+    }
+
+    // 读取输入 tensor 信息
+    const TfLiteTensor* input = TfLiteInterpreterGetInputTensor(g_interpreter, 0);
+    if (input) {
+        int ndim = TfLiteTensorNumDims(input);
+        g_model_input_h = TfLiteTensorDim(input, 1);
+        g_model_input_w = TfLiteTensorDim(input, 2);
+        g_input_type = TfLiteTensorType(input);
+        TfLiteQuantizationParams q = TfLiteTensorQuantizationParams(input);
+        g_input_scale = q.scale;
+        g_input_zero_point = q.zero_point;
+        g_cfg.inputW = g_model_input_w;
+        g_cfg.inputH = g_model_input_h;
+        logd("Model input: %dx%d, type=%d, scale=%.4f, zp=%d",
+             g_model_input_w, g_model_input_h, (int)g_input_type, g_input_scale, g_input_zero_point);
+    }
+
+    // 读取输出 tensor 信息
+    int outCount = TfLiteInterpreterGetOutputTensorCount(g_interpreter);
+    logd("Model outputs: %d", outCount);
+    if (outCount > 0) {
+        const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(g_interpreter, 0);
+        if (out) {
+            int ndim = TfLiteTensorNumDims(out);
+            int channels = ndim >= 2 ? TfLiteTensorDim(out, ndim - 1) : 0;
+            g_num_classes = channels - 4;
+            if (g_num_classes < 1) g_num_classes = 1;
+            logd("Output: dims=%d, channels=%d, classes=%d", ndim, channels, g_num_classes);
+        }
+    }
+
+    logd("TFLite model loaded successfully");
     return true;
 }
 
 void aimbot_shutdown() {
-    if (g_pid.pointerDown) touch_up(TOUCH_VIRTUAL_SLOT);
-    touch_close_aimbot();
-    if (g_net) { delete g_net; g_net = nullptr; }
+    if (g_interpreter) { TfLiteInterpreterDelete(g_interpreter); g_interpreter = nullptr; }
+    if (g_model) { TfLiteModelDelete(g_model); g_model = nullptr; }
 }
 
-void aimbot_toggle_enabled() { g_cfg.enabled = !g_cfg.enabled; }
-void aimbot_toggle_fire() { g_cfg.fireEnabled = !g_cfg.fireEnabled; }
-void aimbot_set_fire(bool down) {
-    if (down) touch_down(TOUCH_TRIGGER_SLOT, TOUCH_TRIGGER_ID, g_cfg.screenW / 2, g_cfg.screenH / 2);
-    else touch_up(TOUCH_TRIGGER_SLOT);
-}
+// ═══════════════════════════════════════════════════════════════════
+//  屏幕截图 (screencap PNG → stb_image 解码)
+// ═══════════════════════════════════════════════════════════════════
+static bool capture_screen_png(uint8_t*& outBuf, int& outW, int& outH, int& outCh) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "screencap -p /data/local/tmp/_aimcap.png 2>/dev/null");
 
-void aimbot_loop_iteration() {
-    static Detection dets[64];
-    // 截屏
-    size_t pngLen = 0;
-    uint8_t* png = capture_screen_png(&pngLen);
-    if (!png || pngLen == 0) return;
-    int iw, ih, ch;
-    uint8_t* rgba = stbi_load_from_memory(png, (int)pngLen, &iw, &ih, &ch, 4);
-    free(png);
-    if (!rgba) return;
-    // 裁剪中心区域
-    int rw = g_cfg.rangeRadius * 2, rh = g_cfg.rangeRadius * 2;
-    int ox = (iw - rw) / 2, oy = (ih - rh) / 2;
-    if (ox < 0) { ox = 0; rw = iw; }
-    if (oy < 0) { oy = 0; rh = ih; }
-    // 推理
-    int n = g_cfg.enabled ? detect_objects(rgba, iw, ih, ox, oy, rw, rh, dets, 64) : 0;
-    stbi_image_free(rgba);
-    // 更新检测结果
-    {
-        std::lock_guard<std::mutex> lk(g_detections_mutex);
-        g_detections.clear();
-        for (int i = 0; i < n; i++) g_detections.push_back(dets[i]);
+    int ret = system(cmd);
+    if (ret != 0) {
+        loge("screencap failed");
+        return false;
     }
-    // PID 自瞄
-    if (g_cfg.enabled && n > 0) {
-        int scx = g_cfg.screenW / 2, scy = g_cfg.screenH / 2;
-        Detection* t = select_target(dets, n, scx, scy);
-        if (t) pid_aim((t->x1+t->x2)*0.5f, (t->y1+t->y2)*0.5f);
-    } else if (!g_cfg.enabled && g_pid.pointerDown) {
+
+    FILE* f = fopen("/data/local/tmp/_aimcap.png", "rb");
+    if (!f) { loge("open png failed"); return false; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> pngBuf(sz);
+    fread(pngBuf.data(), 1, sz, f);
+    fclose(f);
+
+    int w, h, c;
+    unsigned char* img = stbi_load_from_memory(pngBuf.data(), (int)sz, &w, &h, &c, 4);
+    if (!img) { loge("stbi_load failed"); return false; }
+
+    outBuf = img;
+    outW = w;
+    outH = h;
+    outCh = 4;
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TFLite 推理 + YOLO 解码
+// ═══════════════════════════════════════════════════════════════════
+
+// 安全 sigmoid
+static float safeSigmoid(float x) {
+    if (x >= 0.0f && x <= 1.0f) return x;
+    if (x > -30.0f && x < 30.0f) return 1.0f / (1.0f + std::exp(-x));
+    return x > 0.0f ? 1.0f : 0.0f;
+}
+
+static bool isValidNumber(float v) {
+    return std::isfinite(v) && std::fabs(v) < 100000.0f;
+}
+
+// 读取输出 tensor 数据
+struct OutputTensorData {
+    std::vector<int> shape;
+    std::vector<float> values;
+};
+
+static bool readOutput(const TfLiteTensor* t, OutputTensorData& out) {
+    if (!t) return false;
+    int dims = TfLiteTensorNumDims(t);
+    out.shape.reserve(dims);
+    for (int i = 0; i < dims; ++i) out.shape.push_back(TfLiteTensorDim(t, i));
+    while (out.shape.size() > 1 && out.shape[0] == 1) out.shape.erase(out.shape.begin());
+
+    size_t n = TfLiteTensorByteSize(t);
+    TfLiteType type = TfLiteTensorType(t);
+    if (type == kTfLiteFloat32) {
+        const float* data = static_cast<const float*>(TfLiteTensorData(t));
+        out.values.assign(data, data + n / sizeof(float));
+        return true;
+    }
+
+    TfLiteQuantizationParams q = TfLiteTensorQuantizationParams(t);
+    if ((type == kTfLiteInt8 || type == kTfLiteUInt8) && q.scale > 0.0f) {
+        const uint8_t* data = static_cast<const uint8_t*>(TfLiteTensorData(t));
+        out.values.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            int raw = type == kTfLiteUInt8 ? data[i] : static_cast<int>(static_cast<int8_t>(data[i]));
+            out.values[i] = (raw - q.zero_point) * q.scale;
+        }
+        return true;
+    }
+    return false;
+}
+
+// 构建 Detection（归一化坐标）
+static Detection makeDet(float x1, float y1, float x2, float y2,
+                         float score, int classId, int inW, int inH) {
+    float invW = 1.0f / (float)g_cfg.screenW;
+    float invH = 1.0f / (float)g_cfg.screenH;
+    return { x1 * invW, y1 * invH, x2 * invW, y2 * invH, score, classId };
+}
+
+// 解码 NMS 格式输出 [boxCount, 6]
+static bool decodeNmsOutput(const float* out, int dim0, int dim1,
+                            int inW, int inH, std::vector<Detection>& dets) {
+    int boxCount = (dim1 >= 6 && dim1 <= 8) ? dim0 : (dim0 >= 6 && dim0 <= 8 ? dim1 : 0);
+    if (boxCount <= 0) return false;
+
+    dets.clear();
+    dets.reserve(std::min(boxCount, 128));
+    for (int i = 0; i < boxCount; ++i) {
+        float a0, a1, a2, a3, score, label;
+        if (dim1 >= 6 && dim1 <= 8) {
+            const float* p = out + (size_t)i * dim1;
+            a0 = p[0]; a1 = p[1]; a2 = p[2]; a3 = p[3]; score = p[4]; label = p[5];
+            if (dim1 >= 7 && p[6] >= 0.0f && p[6] <= 1.0f && (score < 0.0f || score > 1.0f)) score = p[6];
+        } else {
+            a0 = out[i]; a1 = out[dim1 + i]; a2 = out[2*dim1 + i]; a3 = out[3*dim1 + i];
+            score = out[4*dim1 + i]; label = out[5*dim1 + i];
+        }
+        if (!isValidNumber(a0) || !isValidNumber(a1) || !isValidNumber(a2) || !isValidNumber(a3) || !isValidNumber(score)) continue;
+
+        float s = score;
+        if (s > 1.0f && s <= 100.0f) s *= 0.01f;
+        else s = safeSigmoid(s);
+        if (s < g_cfg.confThresh || s > 1.0f) continue;
+
+        // 尝试两种 box 格式
+        float boxes[2][4] = {
+            {a0, a1, a2, a3},
+            {a0 - a2*0.5f, a1 - a3*0.5f, a0 + a2*0.5f, a1 + a3*0.5f}
+        };
+        for (auto& b : boxes) {
+            float x1 = clampValue(b[0], 0.0f, (float)(inW - 1));
+            float y1 = clampValue(b[1], 0.0f, (float)(inH - 1));
+            float x2 = clampValue(b[2], 0.0f, (float)(inW - 1));
+            float y2 = clampValue(b[3], 0.0f, (float)(inH - 1));
+            if (x2 - x1 >= 2.0f && y2 - y1 >= 2.0f) {
+                int cid = std::max(0, std::min(g_num_classes - 1, (int)std::round(label)));
+                dets.push_back(makeDet(x1, y1, x2, y2, s, cid, inW, inH));
+                break;
+            }
+        }
+    }
+    return !dets.empty();
+}
+
+// 解码 raw YOLO 输出 [channels, anchors]
+static bool decodeRawYolo(const float* out, int dim0, int dim1,
+                          int inW, int inH, std::vector<Detection>& dets) {
+    bool chFirst = dim0 >= 5 && dim0 <= 512 && dim1 > dim0;
+    bool chLast  = dim1 >= 5 && dim1 <= 512 && dim0 > dim1;
+    if (!chFirst && !chLast) return false;
+
+    int ch = chFirst ? dim0 : dim1;
+    int anchors = chFirst ? dim1 : dim0;
+    int cls = ch - 4;
+    if (cls <= 0) return false;
+
+    dets.clear();
+    dets.reserve(128);
+    for (int a = 0; a < anchors; ++a) {
+        float cx = chFirst ? out[a] : out[a * ch + 0];
+        float cy = chFirst ? out[anchors + a] : out[a * ch + 1];
+        float bw = chFirst ? out[2*anchors + a] : out[a * ch + 2];
+        float bh = chFirst ? out[3*anchors + a] : out[a * ch + 3];
+        if (!isValidNumber(cx) || !isValidNumber(cy) || !isValidNumber(bw) || !isValidNumber(bh)) continue;
+
+        int bestCls = -1;
+        float bestScore = 0;
+        for (int c = 0; c < cls; ++c) {
+            float raw = chFirst ? out[(4+c)*anchors + a] : out[a * ch + (4+c)];
+            if (!isValidNumber(raw)) continue;
+            float s = safeSigmoid(raw);
+            if (s > bestScore) { bestScore = s; bestCls = c; }
+        }
+        if (bestScore < g_cfg.confThresh || bestScore > 1.0f || bestCls < 0) continue;
+
+        float boxes[2][4] = {
+            {cx, cy, bw, bh},
+            {cx - bw*0.5f, cy - bh*0.5f, cx + bw*0.5f, cy + bh*0.5f}
+        };
+        for (auto& b : boxes) {
+            float x1 = clampValue(b[0], 0.0f, (float)(inW - 1));
+            float y1 = clampValue(b[1], 0.0f, (float)(inH - 1));
+            float x2 = clampValue(b[2], 0.0f, (float)(inW - 1));
+            float y2 = clampValue(b[3], 0.0f, (float)(inH - 1));
+            if (x2 - x1 >= 2.0f && y2 - y1 >= 2.0f) {
+                dets.push_back(makeDet(x1, y1, x2, y2, bestScore, bestCls, inW, inH));
+                break;
+            }
+        }
+    }
+    return !dets.empty();
+}
+
+// 自动检测输出格式并解码
+static std::vector<Detection> decodeYoloOutput(const OutputTensorData& output) {
+    std::vector<Detection> dets;
+    if (output.shape.size() < 2 || output.shape.size() > 3) return dets;
+
+    int dim0 = output.shape[0];
+    int dim1 = output.shape[1];
+
+    // 尝试 NMS 格式
+    if (decodeNmsOutput(output.values.data(), dim0, dim1, g_model_input_w, g_model_input_h, dets))
+        return dets;
+
+    // 尝试 raw YOLO 格式
+    if (decodeRawYolo(output.values.data(), dim0, dim1, g_model_input_w, g_model_input_h, dets))
+        return dets;
+
+    return dets;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PID 自瞄
+// ═══════════════════════════════════════════════════════════════════
+static void pid_aim(const std::vector<Detection>& dets, long long frameTime) {
+    if (dets.empty() || !g_cfg.enabled) {
+        if (g_pid.pointerDown) {
+            touch_up(TOUCH_VIRTUAL_SLOT);
+            g_pid.pointerDown = false;
+        }
+        if (g_pid.deadzoneFrames > 0) g_pid.deadzoneFrames--;
+        return;
+    }
+
+    // 选最高分检测
+    const Detection* best = &dets[0];
+    for (auto& d : dets) {
+        if (d.score > best->score) best = &d;
+    }
+
+    float cx = (best->x1 + best->x2) * 0.5f;
+    float cy = (best->y1 + best->y2) * 0.5f;
+    float targetX = cx * g_cfg.screenW;
+    float targetY = cy * g_cfg.screenH;
+    float centerX = g_cfg.screenW * 0.5f;
+    float centerY = g_cfg.screenH * 0.5f;
+
+    float errorX = targetX - centerX;
+    float errorY = targetY - centerY;
+    float dist = sqrtf(errorX * errorX + errorY * errorY);
+
+    if (dist > g_cfg.rangeRadius) {
+        if (g_pid.pointerDown) {
+            touch_up(TOUCH_VIRTUAL_SLOT);
+            g_pid.pointerDown = false;
+        }
+        return;
+    }
+
+    // Deadzone
+    if (dist < 5.0f) {
+        g_pid.deadzoneFrames++;
+        if (g_pid.deadzoneFrames > 3 && g_pid.pointerDown) {
+            touch_up(TOUCH_VIRTUAL_SLOT);
+            g_pid.pointerDown = false;
+        }
+        return;
+    }
+    g_pid.deadzoneFrames = 0;
+
+    // PID
+    float dt = frameTime / 1000000.0f;
+    if (dt <= 0.001f) dt = 0.016f;
+
+    g_pid.integralX += errorX * dt;
+    g_pid.integralY += errorY * dt;
+    float derivX = (errorX - g_pid.prevErrorX) / dt;
+    float derivY = (errorY - g_pid.prevErrorY) / dt;
+    g_pid.prevErrorX = errorX;
+    g_pid.prevErrorY = errorY;
+
+    float moveX = g_cfg.kp * errorX + g_cfg.ki * g_pid.integralX + g_cfg.kd * derivX;
+    float moveY = g_cfg.kp * errorY + g_cfg.ki * g_pid.integralY + g_cfg.kd * derivY;
+
+    // 平滑
+    moveX = g_cfg.smooth * moveX + (1.0f - g_cfg.smooth) * g_pid.lastMoveX;
+    moveY = g_cfg.smooth * moveY + (1.0f - g_cfg.smooth) * g_pid.lastMoveY;
+    g_pid.lastMoveX = moveX;
+    g_pid.lastMoveY = moveY;
+
+    // 限制单帧最大移动
+    float moveMag = sqrtf(moveX * moveX + moveY * moveY);
+    if (moveMag > g_cfg.maxMovePerFrame * dt) {
+        float scale = g_cfg.maxMovePerFrame * dt / moveMag;
+        moveX *= scale;
+        moveY *= scale;
+    }
+
+    int screenX = (int)(centerX + moveX);
+    int screenY = (int)(centerY + moveY);
+    screenX = std::max(0, std::min(g_cfg.screenW - 1, screenX));
+    screenY = std::max(0, std::min(g_cfg.screenH - 1, screenY));
+
+    if (!g_pid.pointerDown) {
+        touch_down(TOUCH_VIRTUAL_SLOT, TOUCH_VIRTUAL_ID, screenX, screenY);
+        g_pid.pointerDown = true;
+    } else {
+        touch_move(TOUCH_VIRTUAL_SLOT, screenX, screenY);
+    }
+
+    g_pid.centerX = (float)screenX;
+    g_pid.centerY = (float)screenY;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  单帧迭代
+// ═══════════════════════════════════════════════════════════════════
+void aimbot_loop_iteration() {
+    if (!g_interpreter || !g_running) return;
+    long long t0 = getTimeUs();
+
+    // 1. 截屏
+    uint8_t* img = nullptr;
+    int imgW, imgH, imgCh;
+    if (!capture_screen_png(img, imgW, imgH, imgCh)) return;
+    g_cfg.screenW = imgW;
+    g_cfg.screenH = imgH;
+    long long t1 = getTimeUs();
+
+    // 2. 预处理 + 填充输入 tensor
+    TfLiteTensor* input = TfLiteInterpreterGetInputTensor(g_interpreter, 0);
+    if (!input) { stbi_image_free(img); return; }
+
+    int inW = g_model_input_w;
+    int inH = g_model_input_h;
+    void* inputData = TfLiteTensorData(input);
+
+    if (g_input_type == kTfLiteFloat32) {
+        float* data = static_cast<float*>(inputData);
+        for (int y = 0; y < inH; ++y) {
+            int srcY = y * imgH / inH;
+            for (int x = 0; x < inW; ++x) {
+                int srcX = x * imgW / inW;
+                int srcIdx = (srcY * imgW + srcX) * 4;
+                int idx = (y * inW + x) * 3;
+                data[idx + 0] = img[srcIdx + 0] / 255.0f;
+                data[idx + 1] = img[srcIdx + 1] / 255.0f;
+                data[idx + 2] = img[srcIdx + 2] / 255.0f;
+            }
+        }
+    } else if (g_input_type == kTfLiteInt8) {
+        int8_t* data = static_cast<int8_t*>(inputData);
+        float invScale = 1.0f / g_input_scale;
+        for (int y = 0; y < inH; ++y) {
+            int srcY = y * imgH / inH;
+            for (int x = 0; x < inW; ++x) {
+                int srcX = x * imgW / inW;
+                int srcIdx = (srcY * imgW + srcX) * 4;
+                int idx = (y * inW + x) * 3;
+                data[idx + 0] = (int8_t)std::round(img[srcIdx + 0] / 255.0f * invScale + g_input_zero_point);
+                data[idx + 1] = (int8_t)std::round(img[srcIdx + 1] / 255.0f * invScale + g_input_zero_point);
+                data[idx + 2] = (int8_t)std::round(img[srcIdx + 2] / 255.0f * invScale + g_input_zero_point);
+            }
+        }
+    } else if (g_input_type == kTfLiteUInt8) {
+        uint8_t* data = static_cast<uint8_t*>(inputData);
+        float invScale = 1.0f / g_input_scale;
+        for (int y = 0; y < inH; ++y) {
+            int srcY = y * imgH / inH;
+            for (int x = 0; x < inW; ++x) {
+                int srcX = x * imgW / inW;
+                int srcIdx = (srcY * imgW + srcX) * 4;
+                int idx = (y * inW + x) * 3;
+                data[idx + 0] = (uint8_t)std::round(img[srcIdx + 0] / 255.0f * invScale + g_input_zero_point);
+                data[idx + 1] = (uint8_t)std::round(img[srcIdx + 1] / 255.0f * invScale + g_input_zero_point);
+                data[idx + 2] = (uint8_t)std::round(img[srcIdx + 2] / 255.0f * invScale + g_input_zero_point);
+            }
+        }
+    }
+    stbi_image_free(img);
+    long long t2 = getTimeUs();
+
+    // 3. 推理
+    if (TfLiteInterpreterInvoke(g_interpreter) != kTfLiteOk) {
+        loge("Inference failed");
+        return;
+    }
+    long long t3 = getTimeUs();
+
+    // 4. 解码输出
+    std::vector<Detection> dets;
+    int outCount = TfLiteInterpreterGetOutputTensorCount(g_interpreter);
+    for (int i = 0; i < outCount; ++i) {
+        const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(g_interpreter, i);
+        OutputTensorData od;
+        if (readOutput(out, od)) {
+            auto decoded = decodeYoloOutput(od);
+            if (!decoded.empty()) {
+                dets = nms(decoded, g_cfg.nmsThresh);
+                break;
+            }
+        }
+    }
+
+    // 5. PID 自瞄
+    long long frameTime = t3 - t0;
+    pid_aim(dets, frameTime);
+
+    // 6. 更新全局检测结果
+    {
+        std::lock_guard<std::mutex> lock(g_detections_mutex);
+        g_detections = dets;
+    }
+
+    g_frameCount++;
+    g_lastFrameTime = frameTime;
+    float fps = 1000000.0f / (float)frameTime;
+    g_detectFPS = fps;
+    g_aimFPS = fps;
+
+    long long t4 = getTimeUs();
+    if (g_frameCount % 60 == 0) {
+        logd("Frame #%d: cap=%.1fms pre=%.1fms inf=%.1fms dets=%zu fps=%.1f",
+             g_frameCount,
+             (t1-t0)/1000.0, (t2-t1)/1000.0, (t3-t2)/1000.0,
+             dets.size(), fps);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  触摸注入 (uinput)
+// ═══════════════════════════════════════════════════════════════════
+bool touch_init_aimbot(int screenW, int screenH) {
+    (void)screenW; (void)screenH;
+
+    g_uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (g_uinput_fd < 0) {
+        loge("open /dev/uinput failed");
+        return false;
+    }
+
+    ioctl(g_uinput_fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(g_uinput_fd, UI_SET_KEYBIT, BTN_TOUCH);
+    ioctl(g_uinput_fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_SLOT);
+    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_X);
+    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y);
+    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID);
+    ioctl(g_uinput_fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MAJOR);
+
+    struct uinput_setup usetup = {};
+    usetup.id.bustype = BUS_VIRTUAL;
+    usetup.id.vendor = 0x1234;
+    usetup.id.product = 0x5678;
+    strcpy(usetup.name, "yolov8touch");
+    ioctl(g_uinput_fd, UI_DEV_SETUP, &usetup);
+    ioctl(g_uinput_fd, UI_DEV_CREATE);
+
+    logd("uinput device created");
+    return true;
+}
+
+void touch_close_aimbot() {
+    if (g_uinput_fd >= 0) {
+        ioctl(g_uinput_fd, UI_DEV_DESTROY);
+        close(g_uinput_fd);
+        g_uinput_fd = -1;
+    }
+}
+
+static void write_uinput(int type, int code, int value) {
+    struct input_event ev = {};
+    ev.type = type;
+    ev.code = code;
+    ev.value = value;
+    gettimeofday(&ev.time, nullptr);
+    write(g_uinput_fd, &ev, sizeof(ev));
+}
+
+void touch_down(int slot, int id, int x, int y) {
+    if (g_uinput_fd < 0) return;
+    write_uinput(EV_ABS, ABS_MT_SLOT, slot);
+    write_uinput(EV_ABS, ABS_MT_TRACKING_ID, id);
+    write_uinput(EV_ABS, ABS_MT_POSITION_X, x);
+    write_uinput(EV_ABS, ABS_MT_POSITION_Y, y);
+    write_uinput(EV_ABS, ABS_MT_TOUCH_MAJOR, 50);
+    write_uinput(EV_KEY, BTN_TOUCH, 1);
+    write_uinput(EV_SYN, SYN_REPORT, 0);
+}
+
+void touch_move(int slot, int x, int y) {
+    if (g_uinput_fd < 0) return;
+    write_uinput(EV_ABS, ABS_MT_SLOT, slot);
+    write_uinput(EV_ABS, ABS_MT_POSITION_X, x);
+    write_uinput(EV_ABS, ABS_MT_POSITION_Y, y);
+    write_uinput(EV_SYN, SYN_REPORT, 0);
+}
+
+void touch_up(int slot) {
+    if (g_uinput_fd < 0) return;
+    write_uinput(EV_ABS, ABS_MT_SLOT, slot);
+    write_uinput(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    write_uinput(EV_KEY, BTN_TOUCH, 0);
+    write_uinput(EV_SYN, SYN_REPORT, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  开关
+// ═══════════════════════════════════════════════════════════════════
+void aimbot_toggle_enabled() {
+    g_cfg.enabled = !g_cfg.enabled;
+    logd("Aimbot %s", g_cfg.enabled ? "ON" : "OFF");
+    if (!g_cfg.enabled && g_pid.pointerDown) {
         touch_up(TOUCH_VIRTUAL_SLOT);
         g_pid.pointerDown = false;
     }
-    // 帧率统计
-    g_frameCount++;
-    long long now = now_us();
-    if (g_lastFrameTime == 0) g_lastFrameTime = now;
-    if (now - g_lastFrameTime >= 1000000LL) {
-        g_aimFPS = g_frameCount * 1000000.0f / (float)(now - g_lastFrameTime);
-        g_frameCount = 0; g_lastFrameTime = now;
+}
+
+void aimbot_toggle_fire() {
+    g_cfg.fireEnabled = !g_cfg.fireEnabled;
+    logd("Fire %s", g_cfg.fireEnabled ? "ON" : "OFF");
+}
+
+void aimbot_set_fire(bool down) {
+    if (g_cfg.fireEnabled) {
+        if (down) touch_down(TOUCH_TRIGGER_SLOT, TOUCH_TRIGGER_ID,
+                             g_cfg.screenW / 2, g_cfg.screenH / 2);
+        else touch_up(TOUCH_TRIGGER_SLOT);
     }
 }

@@ -11,7 +11,12 @@
 #include <thread>
 #include <mutex>
 #include <vector>
-#include <ncnn/net.h>
+#include <memory>
+#include <algorithm>
+
+// ─── TFLite C API ────────────────────────────────────────────────
+#include "tensorflow/lite/c/c_api.h"
+#include "tensorflow/lite/c/common.h"
 
 // ─── stb_image ───────────────────────────────────────────────────
 #define STBI_NO_STDIO
@@ -21,7 +26,7 @@
 
 // ─── 配置 ────────────────────────────────────────────────────────
 struct AimbotConfig {
-    char modelPath[256] = "/data/local/tmp/yolov8.param";
+    char modelPath[256] = "/data/local/tmp/yolov8n_float_256.tflite";
     int screenW = 1080;
     int screenH = 2400;
     int inputW = 256;
@@ -82,3 +87,48 @@ void touch_close_aimbot();
 void touch_down(int slot, int id, int x, int y);
 void touch_move(int slot, int x, int y);
 void touch_up(int slot);
+
+// ─── 工具 ─────────────────────────────────────────────────────────
+inline long long getTimeUs() {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+inline float clampValue(float value, float lo, float hi) {
+    return std::max(lo, std::min(value, hi));
+}
+
+inline std::vector<Detection> nms(std::vector<Detection>& boxes, float iouThreshold) {
+    if (boxes.empty()) return {};
+    std::sort(boxes.begin(), boxes.end(),
+        [](const Detection& a, const Detection& b) { return a.score > b.score; });
+    auto suppressed = std::make_unique<uint8_t[]>(boxes.size());
+    memset(suppressed.get(), 0, boxes.size());
+    std::vector<Detection> result;
+    result.reserve(boxes.size());
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        if (suppressed[i]) continue;
+        result.push_back(boxes[i]);
+        for (size_t j = i + 1; j < boxes.size(); ++j) {
+            if (suppressed[j]) continue;
+            float x1a = boxes[i].x1, y1a = boxes[i].y1;
+            float x2a = boxes[i].x2, y2a = boxes[i].y2;
+            float x1b = boxes[j].x1, y1b = boxes[j].y1;
+            float x2b = boxes[j].x2, y2b = boxes[j].y2;
+            float interX1 = std::max(x1a, x1b);
+            float interY1 = std::max(y1a, y1b);
+            float interX2 = std::min(x2a, x2b);
+            float interY2 = std::min(y2a, y2b);
+            float interW = interX2 - interX1;
+            float interH = interY2 - interY1;
+            if (interW <= 0 || interH <= 0) continue;
+            float interArea = interW * interH;
+            float areaA = (x2a - x1a) * (y2a - y1a);
+            float areaB = (x2b - x1b) * (y2b - y1b);
+            float iou = interArea / (areaA + areaB - interArea);
+            if (iou > iouThreshold) suppressed[j] = 1;
+        }
+    }
+    return result;
+}

@@ -18,32 +18,15 @@ jobs:
           unzip -q android-ndk-r27c-linux.zip
           echo "NDK_DIR=$(pwd)/android-ndk-r27c" >> $GITHUB_ENV
 
-      - name: Clone YoloTouchHelp (for NCNN libs)
-        run: |
-          git clone https://github.com/ljy13691882678/YoloTouchHelp.git ../YoloTouchHelp --depth 1
-          mkdir -p ncnn
-          cp -r ../YoloTouchHelp/app/src/main/cpp/ncnn/arm64-v8a ncnn/
-          echo "NCNN: $(ls ncnn/arm64-v8a/lib/libncnn.a)"
-
-      - name: Create stub system libs (gui/ui/binder/utils not in NDK)
+      - name: Create stub system libs
         run: |
           CC="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang"
           mkdir -p stub_libs
           echo "void __stub() {}" > /tmp/stub.c
-          for lib in gui ui binder utils; do
+          for lib in gui ui binder utils tensorflowlite_jni; do
             $CC -shared -o stub_libs/lib${lib}.so /tmp/stub.c -Wl,-soname,lib${lib}.so
           done
           echo "STUB_LIBS_DIR=$(pwd)/stub_libs" >> $GITHUB_ENV
-
-      - name: Find static libomp.a (avoids libomp.so at runtime)
-        run: |
-          OMP_A=$(find "$NDK_DIR/toolchains/llvm/prebuilt" -name "libomp.a" -path "*/aarch64/*" 2>/dev/null | head -1)
-          if [ -n "$OMP_A" ]; then
-            echo "Found: $OMP_A"
-            echo "OMP_STATIC_LIB_PATH=$OMP_A" >> $GITHUB_ENV
-          else
-            echo "WARNING: libomp.a not found, binary will need libomp.so on device"
-          fi
 
       - name: Build
         run: |
@@ -53,8 +36,7 @@ jobs:
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-31 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DSTUB_LIBS_DIR="$STUB_LIBS_DIR" \
-            ${OMP_STATIC_LIB_PATH:+-DOMP_STATIC_LIB_PATH="$OMP_STATIC_LIB_PATH"}
+            -DSTUB_LIBS_DIR="$STUB_LIBS_DIR"
           make -j$(nproc) 2>&1 | tail -20
           ls -lh yolov8touch
 
