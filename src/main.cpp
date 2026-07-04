@@ -10,14 +10,14 @@
  *   1. screencap 截屏 → PNG 解码 → RGBA
  *   2. TFLite YOLOv8 推理 → 检测目标框
  *   3. 选最近目标 → PID 控制 → uinput 触摸注入
- *   4. ImGui 渲染透明悬浮窗 → 显示检测框 + 设置面板
+ *   4. ImGui 渲染到 EGL pbuffer → glReadPixels → 写 framebuffer (/dev/graphics/fb0)
  *   5. 60fps 主循环，Ctrl+C 退出
  *
  * 依赖:
  *   - libtensorflowlite_jni.so (放同目录，RPATH=$ORIGIN 自动加载)
- *   - libgui, libui, libbinder (SurfaceComposer 悬浮窗)
  *   - libEGL, libGLESv3 (OpenGL ES 3.0)
  *   - libandroid, liblog (Android 系统库)
+ *   - /dev/graphics/fb0 (framebuffer 设备)
  */
 
 #include "aimbot.h"
@@ -29,7 +29,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <setjmp.h>
 #include <unistd.h>
 
 static OverlayWindow g_overlay;
@@ -37,47 +36,9 @@ static std::thread* g_aimbot_thread = nullptr;
 static bool g_gui_ok = false;
 static bool g_overlay_ok = false;
 
-// ─── SIGBUS 恢复：overlay_init 可能因 SurfaceFlinger 权限崩溃 ─────
-static sigjmp_buf g_sigbus_jmp;
-static volatile sig_atomic_t g_sigbus_caught = 0;
-
-static void sigbus_handler(int sig) {
-    g_sigbus_caught = 1;
-    siglongjmp(g_sigbus_jmp, 1);
-}
-
 // ─── 信号处理 ───────────────────────────────────────────────────
 static void sig_handler(int) {
     g_running = 0;
-}
-
-// 安全的 overlay 初始化，捕获 SIGBUS/SEGV
-static bool safe_overlay_init(int w, int h) {
-    struct sigaction oldBus, oldSegv;
-    struct sigaction sa = {};
-    sa.sa_handler = sigbus_handler;
-    sa.sa_flags = SA_RESETHAND;  // 只捕获一次
-    sigaction(SIGBUS, &sa, &oldBus);
-    sigaction(SIGSEGV, &sa, &oldSegv);
-
-    bool ok = false;
-    if (sigsetjmp(g_sigbus_jmp, 1) == 0) {
-        ok = overlay_init(&g_overlay, w, h);
-    } else {
-        fprintf(stderr, "WARN: overlay_init crashed (signal %d) — running headless\n",
-                g_sigbus_caught ? SIGBUS : SIGSEGV);
-        // 重置为安全状态，防止半初始化值被误用
-        memset(&g_overlay, 0, sizeof(g_overlay));
-        g_overlay.display = EGL_NO_DISPLAY;
-        g_overlay.eglSurface = EGL_NO_SURFACE;
-        g_overlay.context = EGL_NO_CONTEXT;
-        ok = false;
-    }
-
-    // 恢复原始信号处理器
-    sigaction(SIGBUS, &oldBus, nullptr);
-    sigaction(SIGSEGV, &oldSegv, nullptr);
-    return ok;
 }
 
 // ─── 帮助信息 ───────────────────────────────────────────────────
@@ -152,10 +113,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 2. 创建透明悬浮窗 (ImGui 渲染) — 带 SIGBUS 保护
-    g_overlay_ok = safe_overlay_init(g_cfg.screenW, g_cfg.screenH);
+    // 2. 创建 ImGui 渲染层 (framebuffer 直写)
+    g_overlay_ok = overlay_init(&g_overlay, g_cfg.screenW, g_cfg.screenH);
     if (!g_overlay_ok) {
-        fprintf(stderr, "WARN: overlay init failed — running headless\n");
+        fprintf(stderr, "WARN: framebuffer overlay init failed — running headless\n");
     }
 
     // 3. 初始化 ImGui

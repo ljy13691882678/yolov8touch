@@ -23,15 +23,9 @@ jobs:
           git clone https://github.com/ljy13691882678/YoloTouchHelp.git ../YoloTouchHelp --depth 1
           ls -lh ../YoloTouchHelp/app/src/main/cpp/lib/libtensorflowlite_jni.so
 
-      - name: Create stub system libs
+      - name: Prepare stub libs
         run: |
-          CC="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang"
           mkdir -p stub_libs
-          echo "void __stub() {}" > /tmp/stub.c
-          for lib in gui ui binder utils; do
-            $CC -shared -o stub_libs/lib${lib}.so /tmp/stub.c -Wl,-soname,lib${lib}.so
-          done
-          # Use real TFLite .so from YoloTouchHelp
           cp ../YoloTouchHelp/app/src/main/cpp/lib/libtensorflowlite_jni.so stub_libs/
           echo "STUB_LIBS_DIR=$(pwd)/stub_libs" >> $GITHUB_ENV
 
