@@ -27,7 +27,7 @@ bool overlay_init(OverlayWindow* ov, int w, int h) {
     t.show(ov->ctrl);
     t.apply();
     ov->surface = ov->ctrl->getSurface();
-    ov->window = ov->surface.get();
+    ov->window = (ANativeWindow*)ov->surface.get();
     // EGL
     ov->display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (ov->display == EGL_NO_DISPLAY) { fprintf(stderr, "ERR: eglGetDisplay\n"); return false; }
