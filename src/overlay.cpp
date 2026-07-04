@@ -14,7 +14,6 @@
 
 // ─── 函数指针类型 ────────────────────────────────────────────────
 typedef void  (*SCC_ctor_t)(void* self);
-typedef void* (*SCC_createSurface_t)(void* self, void* nameObj, uint32_t w, uint32_t h, int32_t format, uint32_t flags);
 typedef void* (*SC_getSurface_t)(void* sc);
 typedef void  (*Transaction_ctor_t)(void* self);
 typedef void* (*Transaction_setLayer_t)(void* self, void* sc, int32_t layer);
@@ -22,11 +21,19 @@ typedef void* (*Transaction_show_t)(void* self, void* sc);
 typedef int   (*Transaction_apply_t)(void* self);
 typedef void  (*String8_ctor_t)(void* self, const char* s);
 
+// createSurface — 有两套 ABI:
+// v6 (Android <14): 6 params  (self, name, w, h, format, flags)
+// v8 (Android 14+): 9 params  (self, name, w, h, format, flags, parent, metadata, outId)
+typedef void* (*createSurface_v6_t)(void* self, void* name, uint32_t w, uint32_t h, int32_t format, uint32_t flags);
+typedef void* (*createSurface_v8_t)(void* self, void* name, uint32_t w, uint32_t h, int32_t format, int32_t flags,
+                                     void* parent, void* metadata, uint32_t* outId);
+
 static void* g_libgui = nullptr;
 static void* g_libutils = nullptr;
 
 static SCC_ctor_t            p_SCC_ctor = nullptr;
-static SCC_createSurface_t   p_SCC_createSurface = nullptr;
+static void*                p_SCC_createSurface_raw = nullptr;  // 原始地址
+static int                  g_createSurface_version = 0;        // 6 or 8
 static SC_getSurface_t       p_SC_getSurface = nullptr;
 static Transaction_ctor_t    p_Transaction_ctor = nullptr;
 static Transaction_setLayer_t p_Transaction_setLayer = nullptr;
@@ -37,25 +44,23 @@ static String8_ctor_t        p_String8_ctor = nullptr;
 #define SCC_BUF_SIZE        1024
 #define STRING8_BUF_SIZE    64
 #define TRANSACTION_BUF_SIZE 512
+#define LAYER_METADATA_SIZE  1024  // 足够大的零缓冲区
 
 // ═══════════════════════════════════════════════════════════════════
-//  ELF 符号表扫描 — 通过 demangled name 子串匹配
+//  ELF 符号表扫描
 // ═══════════════════════════════════════════════════════════════════
-
-// 用 dl_iterate_phdr 找到 libgui.so 的 ELF 基址，然后遍历 .dynsym
-// 通过 __cxa_demangle 解码 mangled name，子串匹配找到目标符号
 
 struct FindCtx {
-    const char* libname;     // 目标库名，如 "libgui.so"
-    const char* substr;      // demangled 子串，如 "createSurface"
-    void*       result;      // 输出: 符号地址
-    uintptr_t   base;        // 输出: ELF 基址
+    const char* libname;
+    const char* substr;
+    void*       result;
+    char*       demangled_name;  // 输出: demangled 全名 (用于检测 ABI 版本)
 };
 
 static int phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
     (void)size;
     FindCtx* ctx = (FindCtx*)data;
-    if (ctx->result) return 1;  // 已找到
+    if (ctx->result) return 1;
 
     const char* name = info->dlpi_name;
     if (!name || !strstr(name, ctx->libname)) return 0;
@@ -64,7 +69,6 @@ static int phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
     Elf64_Ehdr* ehdr = (Elf64_Ehdr*)base;
     if (ehdr->e_phnum == 0) return 0;
 
-    // 找 PT_DYNAMIC
     Elf64_Phdr* phdr = (Elf64_Phdr*)(base + ehdr->e_phoff);
     Elf64_Dyn* dynamic = nullptr;
     for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -75,7 +79,6 @@ static int phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
     }
     if (!dynamic) return 0;
 
-    // 遍历 .dynamic
     Elf64_Sym* symtab = nullptr;
     const char* strtab = nullptr;
     size_t strtab_size = 0;
@@ -86,7 +89,6 @@ static int phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
     }
     if (!symtab || !strtab || !strtab_size) return 0;
 
-    // 遍历符号
     for (size_t i = 0; i < 65536; i++) {
         if (symtab[i].st_name >= strtab_size) break;
         const char* sname = strtab + symtab[i].st_name;
@@ -99,10 +101,12 @@ static int phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
         if (status == 0 && demangled) {
             if (strstr(demangled, ctx->substr)) {
                 ctx->result = (void*)(base + symtab[i].st_value);
-                ctx->base = base;
+                if (ctx->demangled_name) {
+                    ctx->demangled_name = strdup(demangled);
+                }
                 fprintf(stderr, "  ELF: found '%s' -> %s @ %p\n", ctx->substr, demangled, ctx->result);
                 free(demangled);
-                return 1;  // 停止遍历
+                return 1;
             }
             free(demangled);
         }
@@ -110,49 +114,62 @@ static int phdr_callback(struct dl_phdr_info* info, size_t size, void* data) {
     return 0;
 }
 
-static void* find_symbol_by_demangled(const char* libname, const char* demangled_substr) {
-    FindCtx ctx = { libname, demangled_substr, nullptr, 0 };
+static void* find_symbol_by_demangled(const char* libname, const char* demangled_substr,
+                                       char** out_demangled) {
+    FindCtx ctx = { libname, demangled_substr, nullptr, nullptr };
+    if (out_demangled) ctx.demangled_name = nullptr;
     dl_iterate_phdr(phdr_callback, &ctx);
+    if (out_demangled) *out_demangled = ctx.demangled_name;
     return ctx.result;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  加载所有符号
+//  加载所有符号 (自动检测 ABI 版本)
 // ═══════════════════════════════════════════════════════════════════
 static bool load_symbols() {
-    // 先 dlopen 确保库已加载到进程
     g_libgui = dlopen("libgui.so", RTLD_NOW);
     if (!g_libgui) { fprintf(stderr, "DLOPEN: libgui.so not found\n"); return false; }
 
     g_libutils = dlopen("libutils.so", RTLD_NOW);
     if (!g_libutils) { fprintf(stderr, "DLOPEN: libutils.so not found\n"); return false; }
 
-    // String8 构造函数
-    p_String8_ctor = (String8_ctor_t)find_symbol_by_demangled("libutils.so", "String8::String8");
+    p_String8_ctor = (String8_ctor_t)find_symbol_by_demangled("libutils.so", "String8::String8", nullptr);
     if (!p_String8_ctor) { fprintf(stderr, "DLOPEN: String8 ctor not found\n"); return false; }
 
-    // SurfaceComposerClient 构造函数
-    p_SCC_ctor = (SCC_ctor_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::SurfaceComposerClient");
+    p_SCC_ctor = (SCC_ctor_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::SurfaceComposerClient", nullptr);
     if (!p_SCC_ctor) { fprintf(stderr, "DLOPEN: SCC ctor not found\n"); return false; }
 
-    // createSurface
-    p_SCC_createSurface = (SCC_createSurface_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::createSurface");
-    if (!p_SCC_createSurface) {
-        p_SCC_createSurface = (SCC_createSurface_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::createWithSurfaceParent");
+    // createSurface — 检测 ABI 版本
+    char* demangled_cs = nullptr;
+    p_SCC_createSurface_raw = find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::createSurface", &demangled_cs);
+    if (!p_SCC_createSurface_raw) {
+        p_SCC_createSurface_raw = find_symbol_by_demangled("libgui.so", "createWithSurfaceParent", &demangled_cs);
     }
-    if (!p_SCC_createSurface) { fprintf(stderr, "DLOPEN: createSurface not found\n"); return false; }
+    if (!p_SCC_createSurface_raw) { fprintf(stderr, "DLOPEN: createSurface not found\n"); return false; }
 
-    // SurfaceControl::getSurface
-    p_SC_getSurface = (SC_getSurface_t)find_symbol_by_demangled("libgui.so", "SurfaceControl::getSurface");
+    // 根据 demangled 名判断是 v6 (旧) 还是 v8 (新, 含 LayerMetadata/IBinder)
+    if (demangled_cs) {
+        if (strstr(demangled_cs, "LayerMetadata") || strstr(demangled_cs, "IBinder")) {
+            g_createSurface_version = 8;
+            fprintf(stderr, "DLOPEN: createSurface API v8 (Android 14+)\n");
+        } else {
+            g_createSurface_version = 6;
+            fprintf(stderr, "DLOPEN: createSurface API v6 (Android <14)\n");
+        }
+        free(demangled_cs);
+    } else {
+        g_createSurface_version = 6;
+    }
+
+    p_SC_getSurface = (SC_getSurface_t)find_symbol_by_demangled("libgui.so", "SurfaceControl::getSurface", nullptr);
     if (!p_SC_getSurface) { fprintf(stderr, "DLOPEN: getSurface not found\n"); return false; }
 
-    // Transaction
-    p_Transaction_ctor = (Transaction_ctor_t)find_symbol_by_demangled("libgui.so", "SurfaceComposerClient::Transaction::Transaction");
-    p_Transaction_setLayer = (Transaction_setLayer_t)find_symbol_by_demangled("libgui.so", "Transaction::setLayer");
-    p_Transaction_show = (Transaction_show_t)find_symbol_by_demangled("libgui.so", "Transaction::show");
-    p_Transaction_apply = (Transaction_apply_t)find_symbol_by_demangled("libgui.so", "Transaction::apply");
+    p_Transaction_ctor = (Transaction_ctor_t)find_symbol_by_demangled("libgui.so", "Transaction::Transaction", nullptr);
+    p_Transaction_setLayer = (Transaction_setLayer_t)find_symbol_by_demangled("libgui.so", "Transaction::setLayer", nullptr);
+    p_Transaction_show = (Transaction_show_t)find_symbol_by_demangled("libgui.so", "Transaction::show", nullptr);
+    p_Transaction_apply = (Transaction_apply_t)find_symbol_by_demangled("libgui.so", "Transaction::apply", nullptr);
 
-    fprintf(stderr, "DLOPEN: all symbols loaded\n");
+    fprintf(stderr, "DLOPEN: all symbols loaded (createSurface v%d)\n", g_createSurface_version);
     return true;
 }
 
@@ -179,8 +196,23 @@ bool overlay_init(OverlayWindow* ov, int w, int h) {
     memset(nameBuf, 0, sizeof(nameBuf));
     p_String8_ctor(nameBuf, "yolov8touch");
 
-    // ─── 3. createSurface ────────────────────────────────────────
-    void* sc = p_SCC_createSurface(ov->scc, nameBuf, (uint32_t)w, (uint32_t)h, 1, 0);
+    // ─── 3. createSurface (ABI 自适应) ────────────────────────────
+    void* sc = nullptr;
+    if (g_createSurface_version == 8) {
+        // Android 14+: 需要 LayerMetadata 缓冲区 + parentHandle + outId
+        void* metadataBuf = calloc(1, LAYER_METADATA_SIZE);
+        uint32_t outId = 0;
+        createSurface_v8_t fn = (createSurface_v8_t)p_SCC_createSurface_raw;
+        sc = fn(ov->scc, nameBuf, (uint32_t)w, (uint32_t)h, 1, 0, nullptr, metadataBuf, &outId);
+        free(metadataBuf);
+        fprintf(stderr, "createSurface(v8) -> %p, outId=%u\n", sc, outId);
+    } else {
+        // Android <14: 旧 API
+        createSurface_v6_t fn = (createSurface_v6_t)p_SCC_createSurface_raw;
+        sc = fn(ov->scc, nameBuf, (uint32_t)w, (uint32_t)h, 1, 0);
+        fprintf(stderr, "createSurface(v6) -> %p\n", sc);
+    }
+
     if (!sc) {
         fprintf(stderr, "ERR: createSurface returned null\n");
         return false;
