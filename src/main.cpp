@@ -2,7 +2,9 @@
  * yolov8touch — Root shell AI 自瞄 + ImGui 可视化 UI
  *
  * 运行方式:
- *   su -c /data/local/tmp/yolov8touch --model /data/local/tmp/yolov8n_float_256.tflite
+ *   su -c /data/adb/yolov8touch
+ *   (无需 LD_LIBRARY_PATH，libtensorflowlite_jni.so 放在同目录即可)
+ *   (无需 --model，自动搜索同目录和常用路径的 .tflite 模型)
  *
  * 原理:
  *   1. screencap 截屏 → PNG 解码 → RGBA
@@ -12,7 +14,7 @@
  *   5. 60fps 主循环，Ctrl+C 退出
  *
  * 依赖:
- *   - libtensorflowlite_jni.so (TFLite, 设备自带)
+ *   - libtensorflowlite_jni.so (放同目录，RPATH=$ORIGIN 自动加载)
  *   - libgui, libui, libbinder (SurfaceComposer 悬浮窗)
  *   - libEGL, libGLESv3 (OpenGL ES 3.0)
  *   - libandroid, liblog (Android 系统库)
@@ -43,14 +45,18 @@ static void print_usage(const char* prog) {
         "YOLOv8 Touch Aimbot with ImGui Overlay\n"
         "Usage: %s [OPTIONS]\n\n"
         "Options:\n"
-        "  --model PATH      NCNN .param path (default: /data/local/tmp/yolov8.param)\n"
-        "  --width W          Screen width (default: 1080)\n"
-        "  --height H         Screen height (default: 2400)\n"
+        "  --model PATH      TFLite model path (auto-detect if not set)\n"
+        "  --width W          Screen width (auto-detect from screencap)\n"
+        "  --height H         Screen height (auto-detect from screencap)\n"
         "  --range R          Detection range radius px (default: 300)\n"
         "  --conf C           Confidence threshold (default: 0.25)\n"
         "  --help             Show this help\n\n"
         "Example:\n"
-        "  su -c %s --model /sdcard/yolov8.param --width 1080 --height 2400\n\n"
+        "  su -c %s\n\n"
+        "Deploy:\n"
+        "  Put yolov8touch + libtensorflowlite_jni.so together in /data/adb/\n"
+        "  Put .tflite model in same dir or /data/local/tmp/\n"
+        "  Just run, no extra env vars needed!\n\n"
         "Controls:\n"
         "  START/STOP button  Toggle AI aiming\n"
         "  FIRE ON/OFF button Toggle auto fire\n"
@@ -60,12 +66,15 @@ static void print_usage(const char* prog) {
 }
 
 // ─── 解析参数 ───────────────────────────────────────────────────
+static bool g_modelArgProvided = false;
+
 static void parse_args(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             print_usage(argv[0]); exit(0);
         } else if (!strcmp(argv[i], "--model") && i + 1 < argc) {
             strncpy(g_cfg.modelPath, argv[++i], sizeof(g_cfg.modelPath) - 1);
+            g_modelArgProvided = true;
         } else if (!strcmp(argv[i], "--width") && i + 1 < argc) {
             g_cfg.screenW = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--height") && i + 1 < argc) {
@@ -87,6 +96,12 @@ int main(int argc, char** argv) {
     fprintf(stderr, "========================================\n");
     fprintf(stderr, "  YOLOv8 Touch Aimbot v1.0\n");
     fprintf(stderr, "  Screen: %dx%d | Range: %dpx\n", g_cfg.screenW, g_cfg.screenH, g_cfg.rangeRadius);
+
+    // 如果没有通过 --model 指定，自动搜索同目录/常用路径的 .tflite
+    if (!g_modelArgProvided) {
+        fprintf(stderr, "  Model: auto-detecting...\n");
+        aimbot_auto_detect_model();
+    }
     fprintf(stderr, "  Model: %s\n", g_cfg.modelPath);
     fprintf(stderr, "========================================\n");
 

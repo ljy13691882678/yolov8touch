@@ -4,6 +4,9 @@
 #include <array>
 #include <chrono>
 #include <cstdarg>
+#include <dirent.h>
+#include <libgen.h>
+#include <sys/stat.h>
 
 // ─── 全局变量 ────────────────────────────────────────────────────
 volatile int g_running = 0;
@@ -201,6 +204,69 @@ bool aimbot_reload_model(const char* newPath) {
     logd("Model reloaded: %s (%dx%d, type=%d, classes=%d)",
          newPath, g_model_input_w, g_model_input_h, (int)g_input_type, g_num_classes);
     return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  自动搜索模型文件
+// ═══════════════════════════════════════════════════════════════════
+
+// 搜索目录中第一个 .tflite 文件，结果写入 dst，返回是否找到
+static bool find_tflite_in_dir(const char* dir, char* dst, size_t dstSize) {
+    DIR* d = opendir(dir);
+    if (!d) return false;
+    bool found = false;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        const char* name = ent->d_name;
+        size_t len = strlen(name);
+        if (len > 7 && !strcasecmp(name + len - 7, ".tflite")) {
+            snprintf(dst, dstSize, "%s/%s", dir, name);
+            struct stat st;
+            if (stat(dst, &st) == 0 && S_ISREG(st.st_mode)) {
+                found = true;
+                break;
+            }
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+void aimbot_auto_detect_model() {
+    char path[256];
+
+    // 1. 获取二进制所在目录 (通过 /proc/self/exe)
+    char selfPath[256];
+    ssize_t n = readlink("/proc/self/exe", selfPath, sizeof(selfPath) - 1);
+    if (n > 0) {
+        selfPath[n] = '\0';
+        char* dir = dirname(selfPath);
+        if (find_tflite_in_dir(dir, path, sizeof(path))) {
+            logd("Auto-detected model in binary dir: %s", path);
+            strncpy(g_cfg.modelPath, path, sizeof(g_cfg.modelPath) - 1);
+            return;
+        }
+    }
+
+    // 2. 搜索常用路径
+    const char* searchDirs[] = {
+        "/data/local/tmp",
+        "/data/adb",
+        "/sdcard",
+        "/sdcard/Download",
+        "/data/adb/modules",
+        nullptr
+    };
+    for (int i = 0; searchDirs[i]; i++) {
+        if (find_tflite_in_dir(searchDirs[i], path, sizeof(path))) {
+            logd("Auto-detected model in %s: %s", searchDirs[i], path);
+            strncpy(g_cfg.modelPath, path, sizeof(g_cfg.modelPath) - 1);
+            return;
+        }
+    }
+
+    // 3. 没找到，保留默认值
+    logd("No .tflite model found in common paths, using default: %s", g_cfg.modelPath);
 }
 
 // ═══════════════════════════════════════════════════════════════════

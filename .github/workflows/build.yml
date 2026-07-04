@@ -51,4 +51,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: yolov8touch-arm64
-          path: build/yolov8touch
+          path: |
+            build/yolov8touch
+            stub_libs/libtensorflowlite_jni.so

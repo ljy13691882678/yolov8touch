@@ -77,6 +77,7 @@ extern long long g_lastFrameTime;
 bool aimbot_init();
 void aimbot_shutdown();
 bool aimbot_reload_model(const char* newPath);  // 运行时切换模型，立即生效
+void aimbot_auto_detect_model();  // 自动搜索同目录/常用路径的 .tflite 模型
 void aimbot_loop_iteration();  // 单帧迭代
 void aimbot_toggle_enabled();
 void aimbot_toggle_fire();
