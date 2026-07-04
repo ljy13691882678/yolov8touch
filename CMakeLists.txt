@@ -64,7 +64,14 @@ target_link_options(yolov8touch PRIVATE -fopenmp)
 # Private Android system libs (gui/ui/binder/utils) are not in NDK.
 # CI provides stub .so files; real libs are on the device at runtime.
 if(DEFINED STUB_LIBS_DIR)
-    link_directories(${STUB_LIBS_DIR})
+    macro(add_stub_lib name)
+        add_library(${name} SHARED IMPORTED)
+        set_target_properties(${name} PROPERTIES IMPORTED_LOCATION ${STUB_LIBS_DIR}/lib${name}.so)
+    endmacro()
+    add_stub_lib(gui)
+    add_stub_lib(ui)
+    add_stub_lib(binder)
+    add_stub_lib(utils)
 endif()
 
 target_link_libraries(yolov8touch
