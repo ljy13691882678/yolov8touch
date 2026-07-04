@@ -29,14 +29,48 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <setjmp.h>
 #include <unistd.h>
 
 static OverlayWindow g_overlay;
 static std::thread* g_aimbot_thread = nullptr;
 
+// ─── SIGBUS 恢复：overlay_init 可能因 SurfaceFlinger 权限崩溃 ─────
+static sigjmp_buf g_sigbus_jmp;
+static volatile sig_atomic_t g_sigbus_caught = 0;
+
+static void sigbus_handler(int sig) {
+    g_sigbus_caught = 1;
+    siglongjmp(g_sigbus_jmp, 1);
+}
+
 // ─── 信号处理 ───────────────────────────────────────────────────
 static void sig_handler(int) {
     g_running = 0;
+}
+
+// 安全的 overlay 初始化，捕获 SIGBUS/SEGV
+static bool safe_overlay_init(int w, int h) {
+    struct sigaction oldBus, oldSegv;
+    struct sigaction sa = {};
+    sa.sa_handler = sigbus_handler;
+    sa.sa_flags = SA_RESETHAND;  // 只捕获一次
+    sigaction(SIGBUS, &sa, &oldBus);
+    sigaction(SIGSEGV, &sa, &oldSegv);
+
+    bool ok = false;
+    if (sigsetjmp(g_sigbus_jmp, 1) == 0) {
+        ok = overlay_init(&g_overlay, w, h);
+    } else {
+        fprintf(stderr, "WARN: overlay_init crashed (signal %d) — running headless\n",
+                g_sigbus_caught ? SIGBUS : SIGSEGV);
+        ok = false;
+    }
+
+    // 恢复原始信号处理器
+    sigaction(SIGBUS, &oldBus, nullptr);
+    sigaction(SIGSEGV, &oldSegv, nullptr);
+    return ok;
 }
 
 // ─── 帮助信息 ───────────────────────────────────────────────────
@@ -111,8 +145,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 2. 创建透明悬浮窗 (ImGui 渲染)
-    if (!overlay_init(&g_overlay, g_cfg.screenW, g_cfg.screenH)) {
+    // 2. 创建透明悬浮窗 (ImGui 渲染) — 带 SIGBUS 保护
+    if (!safe_overlay_init(g_cfg.screenW, g_cfg.screenH)) {
         fprintf(stderr, "WARN: overlay init failed — running headless\n");
     }
 

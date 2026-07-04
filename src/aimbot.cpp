@@ -110,10 +110,13 @@ bool aimbot_init() {
         const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(g_interpreter, 0);
         if (out) {
             int ndim = TfLiteTensorNumDims(out);
-            int channels = ndim >= 2 ? TfLiteTensorDim(out, ndim - 1) : 0;
+            int dim0 = ndim >= 2 ? TfLiteTensorDim(out, ndim - 2) : 0;
+            int dim1 = ndim >= 2 ? TfLiteTensorDim(out, ndim - 1) : 0;
+            int channels = (dim0 > 0 && dim1 > 0) ? std::min(dim0, dim1) : 0;
             g_num_classes = channels - 4;
             if (g_num_classes < 1) g_num_classes = 1;
-            logd("Output: dims=%d, channels=%d, classes=%d", ndim, channels, g_num_classes);
+            logd("Output: shape=[%d,%d], channels=%d, classes=%d",
+                 dim0, dim1, channels, g_num_classes);
         }
     }
 
@@ -184,9 +187,15 @@ bool aimbot_reload_model(const char* newPath) {
         const TfLiteTensor* out = TfLiteInterpreterGetOutputTensor(newInterp, 0);
         if (out) {
             int ndim = TfLiteTensorNumDims(out);
-            int channels = ndim >= 2 ? TfLiteTensorDim(out, ndim - 1) : 0;
+            // YOLO 输出是 [1, channels, anchors] 或 [1, anchors, channels]
+            // 取较小的维度作为 channels (4+classes)
+            int dim0 = ndim >= 2 ? TfLiteTensorDim(out, ndim - 2) : 0;
+            int dim1 = ndim >= 2 ? TfLiteTensorDim(out, ndim - 1) : 0;
+            int channels = (dim0 > 0 && dim1 > 0) ? std::min(dim0, dim1) : 0;
             g_num_classes = channels - 4;
             if (g_num_classes < 1) g_num_classes = 1;
+            logd("Output: shape=[%d,%d], channels=%d, classes=%d",
+                 dim0, dim1, channels, g_num_classes);
         }
     }
 
