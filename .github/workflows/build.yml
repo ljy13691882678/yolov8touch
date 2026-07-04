@@ -25,6 +25,16 @@ jobs:
           cp -r ../YoloTouchHelp/app/src/main/cpp/ncnn/arm64-v8a ncnn/
           echo "NCNN: $(ls ncnn/arm64-v8a/lib/libncnn.a)"
 
+      - name: Create stub system libs (gui/ui/binder/utils not in NDK)
+        run: |
+          CC="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang"
+          mkdir -p stub_libs
+          echo "void __stub() {}" > /tmp/stub.c
+          for lib in gui ui binder utils; do
+            $CC -shared -o stub_libs/lib${lib}.so /tmp/stub.c -Wl,-soname,lib${lib}.so
+          done
+          echo "STUB_LIBS_DIR=$(pwd)/stub_libs" >> $GITHUB_ENV
+
       - name: Build
         run: |
           mkdir -p build && cd build
@@ -32,7 +42,8 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$NDK_DIR/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-31 \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTUB_LIBS_DIR="$STUB_LIBS_DIR"
           make -j$(nproc) 2>&1 | tail -20
           ls -lh yolov8touch
 

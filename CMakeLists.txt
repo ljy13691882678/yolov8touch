@@ -61,6 +61,12 @@ target_include_directories(yolov8touch BEFORE PRIVATE
 target_compile_options(yolov8touch PRIVATE -fopenmp)
 target_link_options(yolov8touch PRIVATE -fopenmp)
 
+# Private Android system libs (gui/ui/binder/utils) are not in NDK.
+# CI provides stub .so files; real libs are on the device at runtime.
+if(DEFINED STUB_LIBS_DIR)
+    link_directories(${STUB_LIBS_DIR})
+endif()
+
 target_link_libraries(yolov8touch
     ncnn glslang SPIRV glslang-default-resource-limits
     MachineIndependent OSDependent OGLCompiler GenericCodeGen
