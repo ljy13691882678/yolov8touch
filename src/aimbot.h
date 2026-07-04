@@ -14,7 +14,6 @@
 #include <ncnn/net.h>
 
 // ─── stb_image ───────────────────────────────────────────────────
-#define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR

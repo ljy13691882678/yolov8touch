@@ -50,6 +50,13 @@ target_include_directories(yolov8touch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# ─── Stub headers for Android private APIs (gui/ui/binder) ────────
+# NDK doesn't ship libgui/libui headers; these stubs let CI compile.
+# At runtime, the real system libs are used on the device.
+target_include_directories(yolov8touch BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/stubs
+)
+
 # OpenMP support for NCNN (NDK toolchain provides -fopenmp built-in)
 target_compile_options(yolov8touch PRIVATE -fopenmp)
 target_link_options(yolov8touch PRIVATE -fopenmp)

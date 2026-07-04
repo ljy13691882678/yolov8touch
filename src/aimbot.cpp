@@ -1,3 +1,4 @@
+#define STB_IMAGE_IMPLEMENTATION
 #include "aimbot.h"
 #include <linux/uinput.h>
 #include <dirent.h>
@@ -96,7 +97,7 @@ static int detect_objects(uint8_t* rgba, int w, int h, int ox, int oy, int rw, i
         float x2 = x1 + box[2]*iiw * rw, y2 = y1 + box[3]*iih * rh;
         if (x1 < 0) x1 = 0; if (y1 < 0) y1 = 0;
         if (x2 > w) x2 = w; if (y2 > h) y2 = h;
-        dets[count++] = {x1, y1, x2, y2, bs, (float)bc};
+        dets[count++] = {x1, y1, x2, y2, bs, (int)bc};
     }
     // NMS
     if (count > 1) {
