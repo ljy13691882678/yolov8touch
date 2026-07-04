@@ -50,6 +50,9 @@ target_include_directories(yolov8touch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# OpenMP support for NCNN
+find_package(OpenMP REQUIRED)
+
 target_link_libraries(yolov8touch
     ncnn glslang SPIRV glslang-default-resource-limits
     MachineIndependent OSDependent OGLCompiler GenericCodeGen

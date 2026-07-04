@@ -107,7 +107,8 @@ int main(int argc, char** argv) {
     }
 
     // 4. 启动 AI 自瞄后台线程
-    g_aimbot_thread = new std::thread([]() {
+    std::chrono::steady_clock::time_point ns = std::chrono::steady_clock::now();
+    g_aimbot_thread = new std::thread([ns]() mutable {
         while (g_running) {
             aimbot_loop_iteration();
             auto now = std::chrono::steady_clock::now();
