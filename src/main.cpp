@@ -66,6 +66,11 @@ static bool safe_overlay_init(int w, int h) {
     } else {
         fprintf(stderr, "WARN: overlay_init crashed (signal %d) — running headless\n",
                 g_sigbus_caught ? SIGBUS : SIGSEGV);
+        // 重置为安全状态，防止半初始化值被误用
+        memset(&g_overlay, 0, sizeof(g_overlay));
+        g_overlay.display = EGL_NO_DISPLAY;
+        g_overlay.eglSurface = EGL_NO_SURFACE;
+        g_overlay.context = EGL_NO_CONTEXT;
         ok = false;
     }
 
@@ -184,7 +189,7 @@ int main(int argc, char** argv) {
 
     // 5. 主循环 (渲染 UI)
     while (g_running) {
-        if (g_overlay.display != EGL_NO_DISPLAY) {
+        if (g_overlay_ok && g_gui_ok) {
             overlay_clear(&g_overlay, 0.0f, 0.0f, 0.0f, 0.0f);
             gui_new_frame();
             gui_render();
