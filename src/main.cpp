@@ -26,15 +26,48 @@
 #include <thread>
 #include <chrono>
 #include <csignal>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
+#include <setjmp.h>
 #include <unistd.h>
 
 static OverlayWindow g_overlay;
 static std::thread* g_aimbot_thread = nullptr;
 static bool g_gui_ok = false;
 static bool g_overlay_ok = false;
+
+// ─── SIGSEGV 安全网：overlay_init 可能因 SurfaceFlinger 权限崩溃 ──
+static sigjmp_buf g_overlay_jmp;
+
+static void overlay_crash_handler(int) {
+    siglongjmp(g_overlay_jmp, 1);
+}
+
+static bool safe_overlay_init(int w, int h) {
+    struct sigaction old_segv, old_bus;
+    struct sigaction sa = {};
+    sa.sa_handler = overlay_crash_handler;
+    sa.sa_flags = SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+
+    bool ok = false;
+    if (sigsetjmp(g_overlay_jmp, 1) == 0) {
+        ok = overlay_init(&g_overlay, w, h);
+    } else {
+        fprintf(stderr, "WARN: overlay_init crashed — running headless\n");
+        memset(&g_overlay, 0, sizeof(g_overlay));
+        g_overlay.display = EGL_NO_DISPLAY;
+        g_overlay.eglSurface = EGL_NO_SURFACE;
+        g_overlay.context = EGL_NO_CONTEXT;
+        ok = false;
+    }
+
+    sigaction(SIGSEGV, &old_segv, nullptr);
+    sigaction(SIGBUS, &old_bus, nullptr);
+    return ok;
+}
 
 // ─── 信号处理 ───────────────────────────────────────────────────
 static void sig_handler(int) {
@@ -114,7 +147,7 @@ int main(int argc, char** argv) {
     }
 
     // 2. 创建 ImGui 渲染层 (framebuffer 直写)
-    g_overlay_ok = overlay_init(&g_overlay, g_cfg.screenW, g_cfg.screenH);
+    g_overlay_ok = safe_overlay_init(g_cfg.screenW, g_cfg.screenH);
     if (!g_overlay_ok) {
         fprintf(stderr, "WARN: framebuffer overlay init failed — running headless\n");
     }

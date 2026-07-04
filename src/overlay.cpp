@@ -192,11 +192,14 @@ bool overlay_init(OverlayWindow* ov, int w, int h) {
     fprintf(stderr, "SurfaceComposerClient created\n");
 
     // ─── 2. String8 ──────────────────────────────────────────────
+    fprintf(stderr, "Constructing String8...\n");
     char nameBuf[STRING8_BUF_SIZE];
     memset(nameBuf, 0, sizeof(nameBuf));
     p_String8_ctor(nameBuf, "yolov8touch");
+    fprintf(stderr, "String8 created\n");
 
     // ─── 3. createSurface (ABI 自适应) ────────────────────────────
+    fprintf(stderr, "Calling createSurface (v%d)...\n", g_createSurface_version);
     void* sc = nullptr;
     if (g_createSurface_version == 8) {
         // Android 14+: 需要 LayerMetadata 缓冲区 + parentHandle + outId
