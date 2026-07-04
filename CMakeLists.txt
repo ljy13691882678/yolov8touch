@@ -68,7 +68,5 @@ set_target_properties(yolov8touch PROPERTIES OUTPUT_NAME "yolov8touch")
 
 # ─── RPATH: 让二进制在同目录找 .so 文件 ───────────────────────────
 # 无需 LD_LIBRARY_PATH，只需把 libtensorflowlite_jni.so 放在同目录
-set_target_properties(yolov8touch PROPERTIES
-    BUILD_RPATH "$ORIGIN"
-    INSTALL_RPATH "$ORIGIN"
-)
+# Android NDK 不支持 CMake BUILD_RPATH，直接传 linker flag
+target_link_options(yolov8touch PRIVATE "-Wl,-rpath,$ORIGIN")
