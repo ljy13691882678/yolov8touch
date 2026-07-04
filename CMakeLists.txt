@@ -50,13 +50,13 @@ target_include_directories(yolov8touch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# OpenMP support for NCNN
-find_package(OpenMP REQUIRED)
+# OpenMP support for NCNN (NDK toolchain provides -fopenmp built-in)
+target_compile_options(yolov8touch PRIVATE -fopenmp)
+target_link_options(yolov8touch PRIVATE -fopenmp)
 
 target_link_libraries(yolov8touch
     ncnn glslang SPIRV glslang-default-resource-limits
     MachineIndependent OSDependent OGLCompiler GenericCodeGen
-    OpenMP::OpenMP_CXX
     EGL GLESv3
     gui ui binder utils
     android log
