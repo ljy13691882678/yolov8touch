@@ -34,6 +34,8 @@
 
 static OverlayWindow g_overlay;
 static std::thread* g_aimbot_thread = nullptr;
+static bool g_gui_ok = false;
+static bool g_overlay_ok = false;
 
 // ─── SIGBUS 恢复：overlay_init 可能因 SurfaceFlinger 权限崩溃 ─────
 static sigjmp_buf g_sigbus_jmp;
@@ -146,16 +148,26 @@ int main(int argc, char** argv) {
     }
 
     // 2. 创建透明悬浮窗 (ImGui 渲染) — 带 SIGBUS 保护
-    if (!safe_overlay_init(g_cfg.screenW, g_cfg.screenH)) {
+    g_overlay_ok = safe_overlay_init(g_cfg.screenW, g_cfg.screenH);
+    if (!g_overlay_ok) {
         fprintf(stderr, "WARN: overlay init failed — running headless\n");
     }
 
     // 3. 初始化 ImGui
-    if (g_overlay.display != EGL_NO_DISPLAY) {
-        gui_init(&g_overlay);
+    if (g_overlay_ok && g_overlay.display != EGL_NO_DISPLAY) {
+        g_gui_ok = gui_init(&g_overlay);
     }
 
-    // 4. 启动 AI 自瞄后台线程
+    // 4. 启动运行
+    g_running = 1;
+    fprintf(stderr, "Running... (Ctrl+C to stop)\n");
+
+    // 初始化 uinput 触摸注入
+    if (!touch_init_aimbot(g_cfg.screenW, g_cfg.screenH)) {
+        fprintf(stderr, "WARN: touch init failed — aimbot can't move cursor\n");
+    }
+
+    // 5. 启动 AI 自瞄后台线程
     std::chrono::steady_clock::time_point ns = std::chrono::steady_clock::now();
     g_aimbot_thread = new std::thread([ns]() mutable {
         while (g_running) {
@@ -189,8 +201,9 @@ int main(int argc, char** argv) {
         g_aimbot_thread->join();
         delete g_aimbot_thread;
     }
-    gui_shutdown();
-    overlay_destroy(&g_overlay);
+    if (g_gui_ok) gui_shutdown();
+    if (g_overlay_ok) overlay_destroy(&g_overlay);
+    touch_close_aimbot();
     aimbot_shutdown();
     fprintf(stderr, "Done.\n");
     return 0;
