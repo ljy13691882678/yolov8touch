@@ -3,11 +3,13 @@
 #include <cstring>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <link.h>
+#include <elf.h>
+#include <cxxabi.h>
 #include <android/native_window.h>
 
 // ═══════════════════════════════════════════════════════════════════
-//  运行时动态加载 libgui.so / libutils.so 符号
-//  避免 stub 头文件的 ABI 不匹配问题 — 使用设备自带的真实库
+//  运行时 ELF 符号扫描 — 自动适配不同 Android 版本的 ABI
 // ═══════════════════════════════════════════════════════════════════
 
 // ─── 函数指针类型 ────────────────────────────────────────────────
@@ -16,12 +18,10 @@ typedef void* (*SCC_createSurface_t)(void* self, void* nameObj, uint32_t w, uint
 typedef void* (*SC_getSurface_t)(void* sc);
 typedef void  (*Transaction_ctor_t)(void* self);
 typedef void* (*Transaction_setLayer_t)(void* self, void* sc, int32_t layer);
-typedef void* (*Transaction_setPos_t)(void* self, void* sc, float x, float y);
 typedef void* (*Transaction_show_t)(void* self, void* sc);
 typedef int   (*Transaction_apply_t)(void* self);
 typedef void  (*String8_ctor_t)(void* self, const char* s);
 
-// ─── 全局函数指针 ────────────────────────────────────────────────
 static void* g_libgui = nullptr;
 static void* g_libutils = nullptr;
 
@@ -30,113 +30,124 @@ static SCC_createSurface_t   p_SCC_createSurface = nullptr;
 static SC_getSurface_t       p_SC_getSurface = nullptr;
 static Transaction_ctor_t    p_Transaction_ctor = nullptr;
 static Transaction_setLayer_t p_Transaction_setLayer = nullptr;
-static Transaction_setPos_t  p_Transaction_setPosition = nullptr;
 static Transaction_show_t    p_Transaction_show = nullptr;
 static Transaction_apply_t   p_Transaction_apply = nullptr;
 static String8_ctor_t        p_String8_ctor = nullptr;
 
-// ─── 对象缓冲区大小 (足够大，避免溢出) ────────────────────────────
 #define SCC_BUF_SIZE        1024
 #define STRING8_BUF_SIZE    64
-#define SURFACE_CONTROL_BUF_SIZE  512
-#define TRANSACTION_BUF_SIZE      512
+#define TRANSACTION_BUF_SIZE 512
 
-// ─── 尝试多个可能的 mangled name ─────────────────────────────────
-static void* try_dlsym(void* lib, const char** names, int count) {
-    for (int i = 0; i < count; i++) {
-        void* p = dlsym(lib, names[i]);
-        if (p) return p;
+// ═══════════════════════════════════════════════════════════════════
+//  ELF 符号表扫描 — 通过 demangled name 子串匹配
+// ═══════════════════════════════════════════════════════════════════
+
+// 遍历 .dynsym 表，用 demangled name 子串匹配找符号
+// lib: dlopen 返回的句柄
+// demangled_substr: 要匹配的 demangled 名子串 (如 "createSurface")
+// 返回: 找到的符号地址，未找到返回 nullptr
+static void* find_symbol_by_demangled(void* lib, const char* demangled_substr) {
+    struct link_map* map = nullptr;
+    if (dlinfo(lib, RTLD_DI_LINKMAP, &map) != 0 || !map) {
+        fprintf(stderr, "  ELF: dlinfo(RTLD_DI_LINKMAP) failed\n");
+        return nullptr;
+    }
+
+    uintptr_t base = map->l_addr;
+    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)base;
+    if (ehdr->e_phnum == 0 || ehdr->e_phoff == 0) return nullptr;
+
+    // 找 PT_DYNAMIC 段
+    Elf64_Phdr* phdr = (Elf64_Phdr*)(base + ehdr->e_phoff);
+    Elf64_Dyn* dynamic = nullptr;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_DYNAMIC) {
+            dynamic = (Elf64_Dyn*)(base + phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dynamic) return nullptr;
+
+    // 遍历 .dynamic 找 SYMTAB / STRTAB
+    Elf64_Sym* symtab = nullptr;
+    const char* strtab = nullptr;
+    size_t symcount = 0;
+    for (Elf64_Dyn* d = dynamic; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_SYMTAB) symtab = (Elf64_Sym*)(base + d->d_un.d_ptr);
+        if (d->d_tag == DT_STRTAB) strtab = (const char*)(base + d->d_un.d_ptr);
+        if (d->d_tag == DT_GNU_HASH) {
+            // 粗略估算符号数量 (不求精确，遍历时遇到边界就停)
+            symcount = 50000;
+        }
+    }
+    if (!symtab || !strtab) return nullptr;
+
+    // 没有精确的 symcount 就用一个安全的非精确上限
+    // 遍历到第一个 st_name 越界或遇到空值反复出现为止
+    size_t strtab_size = 0;
+    // 粗略获取 strtab 大小 (通过 DT_STRSZ)
+    for (Elf64_Dyn* d = dynamic; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_STRSZ) { strtab_size = d->d_un.d_val; break; }
+    }
+
+    // 遍历符号表
+    for (size_t i = 0; i < 65536; i++) {
+        if (symtab[i].st_name >= strtab_size) break;  // 越界
+        const char* name = strtab + symtab[i].st_name;
+        if (name[0] == '\0') continue;
+        if (ELF64_ST_TYPE(symtab[i].st_info) != STT_FUNC) continue;
+        if (symtab[i].st_value == 0) continue;
+
+        int status;
+        char* demangled = abi::__cxa_demangle(name, nullptr, nullptr, &status);
+        if (status == 0 && demangled) {
+            if (strstr(demangled, demangled_substr)) {
+                void* addr = (void*)(base + symtab[i].st_value);
+                fprintf(stderr, "  ELF: found '%s' -> %s @ %p\n", demangled_substr, demangled, addr);
+                free(demangled);
+                return addr;
+            }
+            free(demangled);
+        }
     }
     return nullptr;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  加载所有符号
+// ═══════════════════════════════════════════════════════════════════
 static bool load_symbols() {
-    // 加载库
     g_libgui = dlopen("libgui.so", RTLD_NOW);
-    if (!g_libgui) {
-        fprintf(stderr, "DLOPEN: libgui.so not found\n");
-        return false;
-    }
-    g_libutils = dlopen("libutils.so", RTLD_NOW);
-    if (!g_libutils) {
-        fprintf(stderr, "DLOPEN: libutils.so not found\n");
-        return false;
-    }
+    if (!g_libgui) { fprintf(stderr, "DLOPEN: libgui.so not found\n"); return false; }
 
-    // String8 构造函数 (libutils.so)
-    const char* string8_names[] = {
-        "_ZN7android7String8C1EPKc",      // clang 标准
-        "_ZN7android8String16C1EPKc",     // 有些版本用 String16
-        nullptr
-    };
-    p_String8_ctor = (String8_ctor_t)try_dlsym(g_libutils, string8_names, 2);
-    if (!p_String8_ctor) {
-        fprintf(stderr, "DLOPEN: String8 ctor not found\n");
-        return false;
-    }
+    g_libutils = dlopen("libutils.so", RTLD_NOW);
+    if (!g_libutils) { fprintf(stderr, "DLOPEN: libutils.so not found\n"); return false; }
+
+    // String8 构造函数
+    p_String8_ctor = (String8_ctor_t)find_symbol_by_demangled(g_libutils, "String8::String8");
+    if (!p_String8_ctor) { fprintf(stderr, "DLOPEN: String8 ctor not found\n"); return false; }
 
     // SurfaceComposerClient 构造函数
-    const char* scc_names[] = {
-        "_ZN7android21SurfaceComposerClientC1Ev",
-        "_ZN7android21SurfaceComposerClientC2Ev",
-        nullptr
-    };
-    p_SCC_ctor = (SCC_ctor_t)try_dlsym(g_libgui, scc_names, 2);
+    p_SCC_ctor = (SCC_ctor_t)find_symbol_by_demangled(g_libgui, "SurfaceComposerClient::SurfaceComposerClient");
     if (!p_SCC_ctor) { fprintf(stderr, "DLOPEN: SCC ctor not found\n"); return false; }
 
-    // createSurface
-    const char* cs_names[] = {
-        "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8Eiiij",
-        "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EiiijPNS_14SurfaceControlE",
-        "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EiiijPNS_14SurfaceControlERKNS_13LayerMetadataE",
-        nullptr
-    };
-    p_SCC_createSurface = (SCC_createSurface_t)try_dlsym(g_libgui, cs_names, 3);
+    // createSurface (可能有多个重载，取第一个匹配)
+    p_SCC_createSurface = (SCC_createSurface_t)find_symbol_by_demangled(g_libgui, "SurfaceComposerClient::createSurface");
+    if (!p_SCC_createSurface) {
+        // 某些 Android 版本改名了
+        p_SCC_createSurface = (SCC_createSurface_t)find_symbol_by_demangled(g_libgui, "SurfaceComposerClient::createWithSurfaceParent");
+    }
     if (!p_SCC_createSurface) { fprintf(stderr, "DLOPEN: createSurface not found\n"); return false; }
 
     // SurfaceControl::getSurface
-    const char* gs_names[] = {
-        "_ZN7android14SurfaceControl10getSurfaceEv",
-        nullptr
-    };
-    p_SC_getSurface = (SC_getSurface_t)try_dlsym(g_libgui, gs_names, 1);
+    p_SC_getSurface = (SC_getSurface_t)find_symbol_by_demangled(g_libgui, "SurfaceControl::getSurface");
     if (!p_SC_getSurface) { fprintf(stderr, "DLOPEN: getSurface not found\n"); return false; }
 
-    // Transaction 构造函数
-    const char* tr_names[] = {
-        "_ZN7android21SurfaceComposerClient11TransactionC1Ev",
-        "_ZN7android21SurfaceComposerClient11TransactionC2Ev",
-        nullptr
-    };
-    p_Transaction_ctor = (Transaction_ctor_t)try_dlsym(g_libgui, tr_names, 2);
-
-    // Transaction::setLayer
-    const char* sl_names[] = {
-        "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi",
-        nullptr
-    };
-    p_Transaction_setLayer = (Transaction_setLayer_t)try_dlsym(g_libgui, sl_names, 1);
-
-    // Transaction::setPosition
-    const char* sp_names[] = {
-        "_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff",
-        nullptr
-    };
-    p_Transaction_setPosition = (Transaction_setPos_t)try_dlsym(g_libgui, sp_names, 1);
-
-    // Transaction::show
-    const char* sh_names[] = {
-        "_ZN7android21SurfaceComposerClient11Transaction4showERKNS_2spINS_14SurfaceControlEEE",
-        nullptr
-    };
-    p_Transaction_show = (Transaction_show_t)try_dlsym(g_libgui, sh_names, 1);
-
-    // Transaction::apply
-    const char* ap_names[] = {
-        "_ZN7android21SurfaceComposerClient11Transaction5applyEv",
-        nullptr
-    };
-    p_Transaction_apply = (Transaction_apply_t)try_dlsym(g_libgui, ap_names, 1);
+    // Transaction (optional, no error)
+    p_Transaction_ctor = (Transaction_ctor_t)find_symbol_by_demangled(g_libgui, "SurfaceComposerClient::Transaction::Transaction");
+    p_Transaction_setLayer = (Transaction_setLayer_t)find_symbol_by_demangled(g_libgui, "Transaction::setLayer");
+    p_Transaction_show = (Transaction_show_t)find_symbol_by_demangled(g_libgui, "Transaction::show");
+    p_Transaction_apply = (Transaction_apply_t)find_symbol_by_demangled(g_libgui, "Transaction::apply");
 
     fprintf(stderr, "DLOPEN: all symbols loaded\n");
     return true;
@@ -154,21 +165,18 @@ bool overlay_init(OverlayWindow* ov, int w, int h) {
 
     if (!load_symbols()) return false;
 
-    // ─── 1. 创建 SurfaceComposerClient ───────────────────────────
+    // ─── 1. SurfaceComposerClient ────────────────────────────────
     ov->scc = malloc(SCC_BUF_SIZE);
     memset(ov->scc, 0, SCC_BUF_SIZE);
     p_SCC_ctor(ov->scc);
     fprintf(stderr, "SurfaceComposerClient created\n");
 
-    // ─── 2. 构造 String8 ─────────────────────────────────────────
+    // ─── 2. String8 ──────────────────────────────────────────────
     char nameBuf[STRING8_BUF_SIZE];
     memset(nameBuf, 0, sizeof(nameBuf));
     p_String8_ctor(nameBuf, "yolov8touch");
 
     // ─── 3. createSurface ────────────────────────────────────────
-    //     PIXEL_FORMAT_RGBA_8888 = 1
-    //     flags: ISurfaceComposerClient::eHidden = 0x4 (hidden initially)
-    //     flags: 0 = visible by default
     void* sc = p_SCC_createSurface(ov->scc, nameBuf, (uint32_t)w, (uint32_t)h, 1, 0);
     if (!sc) {
         fprintf(stderr, "ERR: createSurface returned null\n");
@@ -184,26 +192,19 @@ bool overlay_init(OverlayWindow* ov, int w, int h) {
         return false;
     }
     ov->surface = surface;
-    fprintf(stderr, "Surface obtained: %p\n", surface);
 
-    // ─── 5. 设置 layer 并显示 (Transaction) ─────────────────────
+    // ─── 5. Transaction ──────────────────────────────────────────
     if (p_Transaction_ctor && p_Transaction_setLayer && p_Transaction_show && p_Transaction_apply) {
         char txBuf[TRANSACTION_BUF_SIZE];
         memset(txBuf, 0, sizeof(txBuf));
         p_Transaction_ctor(txBuf);
-
-        // sp<SurfaceControl> 参数: 传入指针的指针
-        p_Transaction_setLayer(txBuf, &ov->surfaceControl, 0x7fffffff);  // INT_MAX = 最顶层
+        p_Transaction_setLayer(txBuf, &ov->surfaceControl, 0x7fffffff);
         p_Transaction_show(txBuf, &ov->surfaceControl);
         int ret = p_Transaction_apply(txBuf);
         fprintf(stderr, "Transaction applied: ret=%d\n", ret);
     }
 
-    // ─── 6. EGL 初始化 (window surface) ──────────────────────────
-    //     Surface* IS-A ANativeWindow*, 可以直接转换
-    ANativeWindow* nativeWin = (ANativeWindow*)ov->surface;
-    nativeWin = nativeWin;  // 抑制未使用警告
-
+    // ─── 6. EGL 初始化 ───────────────────────────────────────────
     ov->display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (ov->display == EGL_NO_DISPLAY) {
         fprintf(stderr, "ERR: eglGetDisplay\n"); return false;
@@ -218,9 +219,7 @@ bool overlay_init(OverlayWindow* ov, int w, int h) {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 24,
-        EGL_NONE
+        EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 24, EGL_NONE
     };
     EGLConfig cfg; EGLint numCfg;
     if (!eglChooseConfig(ov->display, cfgAttribs, &cfg, 1, &numCfg) || numCfg == 0) {
@@ -233,9 +232,7 @@ bool overlay_init(OverlayWindow* ov, int w, int h) {
         fprintf(stderr, "ERR: eglCreateContext\n"); return false;
     }
 
-    // 设置 ANativeWindow 缓冲区大小
-    ANativeWindow_setBuffersGeometry((ANativeWindow*)ov->surface, w, h, 1);  // RGBA_8888
-
+    ANativeWindow_setBuffersGeometry((ANativeWindow*)ov->surface, w, h, 1);
     ov->eglSurface = eglCreateWindowSurface(ov->display, cfg, (ANativeWindow*)ov->surface, nullptr);
     if (ov->eglSurface == EGL_NO_SURFACE) {
         fprintf(stderr, "ERR: eglCreateWindowSurface (EGL error: %d)\n", eglGetError());
